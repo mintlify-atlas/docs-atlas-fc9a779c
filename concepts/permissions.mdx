@@ -114,7 +114,7 @@ export const permissionStatusSchema = z.enum(["requested", "active", "revoked"])
 | `active` | All listed actions on the object |
 | `revoked` | Nothing — permanently refused (request again for a new one) |
 
-A permission that was `active` may return to `requested` when a non-admin makes a new version of an App current. Specifically, permissions on connections, writable collections, workflows, and another App's `write`-marked exports revert to `requested` until an admin grants them again — approving the new version's code as they do.
+A permission that was `active` may return to `requested` when a non-admin makes a new version of an App current. Specifically, permissions on connections, writable collections, workflows, and another App's exports that aren't exclusively `read`-marked revert to `requested` until an admin grants them again — approving the new version's code as they do.
 
 ## How permissions are checked
 

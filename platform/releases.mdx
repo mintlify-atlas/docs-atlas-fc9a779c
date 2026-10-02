@@ -39,7 +39,7 @@ Nobody pushes to `main` directly. The rules live in `.github/rulesets/` and are 
 
 ## Conventional Commits
 
-PR titles follow [Conventional Commits](https://www.conventionalcommits.org): `type(scope): description`, where scope is the app or package name (`core`, `connect`, `web`, `console`, `router`, `sdk`, `connector-kit`). A `commit-msg` hook and the `conventions` CI job both enforce it. The squash-merge commit becomes the release note shown in the console, so write titles for operators, not just for reviewers.
+PR titles follow [Conventional Commits](https://www.conventionalcommits.org): `type(scope): description`, where scope is the app or package name (`core`, `connect`, `web`, `console`, `router`, `sdk`, `ui`, `compiler`, `connector-kit`, `shared`, `deps` for dependency bumps). A `commit-msg` hook and the `conventions` CI job both enforce it. The squash-merge commit becomes the release note shown in the console, so write titles for operators, not just for reviewers.
 
 ```text
 feat(core): add audit log export in CSV format

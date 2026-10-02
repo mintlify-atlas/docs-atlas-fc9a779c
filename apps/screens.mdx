@@ -1,14 +1,14 @@
 ---
 title: "App Screens: React Components in Sandboxed Iframes"
 sidebarTitle: "Screens"
-description: "Screens are React components compiled by @grasp-os/compiler and rendered in sandboxed iframes. They talk to the server exclusively through @grasp-os/sdk/screen."
+description: "Screens are sandboxed React components that talk to the App server and workflows exclusively through @grasp-os/sdk/screen. No direct network access."
 ---
 
-An App's screens are React components placed in `screens/*.tsx`. Each file becomes one named screen — `screens/inbox.tsx` becomes the `inbox` screen. Screens are compiled by `@grasp-os/compiler` into ES modules with CSS and served as static assets; the browser loads them inside sandboxed iframes so that no screen code can reach the host page or make direct network calls. All communication goes through a structured bridge to core, which checks the person's session and role on every single call.
+An App's screens are React components placed in `screens/*.tsx`. Each file becomes one named screen — `screens/inbox.tsx` becomes the `inbox` screen. When a version is committed, Grasp OS compiles each screen into an ES module and a CSS bundle and serves them as static assets. The browser loads them inside sandboxed iframes so that no screen code can reach the host page or make direct network calls. All communication goes through a structured bridge to core, which checks the person's session and role on every single call.
 
 ## Compilation and the `@grasp-os/ui` component library
 
-Screens are compiled by `@grasp-os/compiler` into plain ES modules and a CSS bundle. The compiler resolves two special imports:
+Grasp OS compiles screens automatically on commit, producing plain ES modules and a CSS bundle. The screen compiler resolves two special imports:
 
 - `@grasp-os/sdk/screen` — the only way to reach the server or workflows (see below)
 - `@grasp-os/ui` — the App's component library: shadcn components built on Base UI, styled with Tailwind v4
@@ -77,7 +77,7 @@ The server-side counterpart must hold the callback via `onChange.dup()` and call
 `useWorkflow` gives a component everything it needs to interact with one of the App's workflows — current runs, starting new ones, reading status, and answering decisions.
 
 ```ts
-const intake = useWorkflow(workflow: string): {
+function useWorkflow(workflow: string): {
   runs: ScreenRun[];
   start: (input?: unknown) => Promise<WorkflowRun>;
   status: (run: string) => Promise<ScreenRun>;
@@ -121,7 +121,7 @@ export default function IntakePanel() {
 `useRun` follows one run by its ID, however old it is. Unlike `useWorkflow`, which lists only the newest 100 runs, `useRun` retrieves any run by ID. It returns `undefined` while the first read is in flight, and `null` when core has no such run or the person may not see it.
 
 ```ts
-const run = useRun(workflow: string, run: string): ScreenRun | null | undefined
+function useRun(workflow: string, run: string): ScreenRun | null | undefined
 ```
 
 ```tsx
@@ -192,6 +192,12 @@ A `ScreenRun` extends `WorkflowRun` with live decision data:
 </ParamField>
 <ParamField path="endedAt" type="string | null">
   ISO 8601 timestamp, or null if still running.
+</ParamField>
+<ParamField path="output" type="unknown | undefined">
+  What the run returned once completed; only visible to the run's starter and admins, and gone once the run's details are removed after 30 days.
+</ParamField>
+<ParamField path="failure" type="{ step: string | null; error: { code: string; message: string } } | undefined">
+  Why the run stopped, once failed; only visible to the run's starter and admins.
 </ParamField>
 
 ### `WaitingDecision`

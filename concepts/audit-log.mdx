@@ -15,7 +15,6 @@ The audit log covers seven event types, each with its own actions:
     Events where data was accessed but nothing changed:
     - Knowledge searches (`knowledge.search`) and document reads (`knowledge.read`)
     - Connector calls that only read data (`connection.call` with `sideEffect: false`)
-    - Model calls that returned data (`model.*`)
     - App export calls that only read (`app.call` with `access: "read"`)
     - Agent calls that weren't otherwise recorded (`agent.call`)
     - Audit log searches and exports (`audit.searched`, `audit.exported`, `audit.verified`)

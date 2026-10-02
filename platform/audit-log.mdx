@@ -1,5 +1,5 @@
 ---
-title: "Grasp OS Audit Log: Architecture and Operations"
+title: "Grasp OS Audit Log: Architecture, Retention, and Operations"
 sidebarTitle: "Audit Log"
 description: "How the hash-chained AuditLog Durable Object works, what it records, retention and archiving to R2, and how admins search, export, and verify it."
 ---
@@ -8,7 +8,7 @@ Every significant action in a Grasp OS deployment — sign-ins, model calls, con
 
 ## The AuditLog Durable Object
 
-The audit log is a single [Durable Object](https://developers.cloudflare.com/durable-objects/) — `AuditLog` — per deployment, pinned to the EU jurisdiction through `jurisdiction("eu")`. It stores events in its built-in SQLite database (D1-backed storage), with one row per event. No other code writes to this database; the object is the sole authority for the chain.
+The audit log is a single [Durable Object](https://developers.cloudflare.com/durable-objects/) — `AuditLog` — per deployment, pinned to the EU jurisdiction through `jurisdiction("eu")`. It stores events in the Durable Object's own built-in SQLite storage (`ctx.storage`), with one row per event. No other code writes to this database; the object is the sole authority for the chain.
 
 ```typescript
 // From apps/core/wrangler.jsonc — the binding that core uses to reach it
@@ -81,10 +81,10 @@ Every record returned by a search or export carries the full chain metadata alon
 
 The audit log captures events across every layer of the platform. Actions are `noun.verbed` in dotted segments, with the most general segment first.
 
-<Accordion title="Authentication and sessions">
-- Sign-in and sign-out (`auth.*`)
+<Accordion title="Members, teams, and staff access">
+- Member role changes, removals, and session revocations (`member.*`)
+- Team creation, updates, deletion, and membership changes (`team.*`)
 - Staff sign-in to a deployment (`staff.session`)
-- Session creation and expiry
 </Accordion>
 
 <Accordion title="Model calls">

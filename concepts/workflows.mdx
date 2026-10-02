@@ -4,14 +4,14 @@ sidebarTitle: "Workflows"
 description: "Durable programs pinned to their App version: four step types, four trigger kinds, replay from recorded step results, and a six-state run lifecycle."
 ---
 
-Workflows are TypeScript programs that run durably on Cloudflare Workflows — an execution engine that persists the result of every step so a run can replay from where it left off after an interruption. Each workflow lives in an App's `workflows/` folder, is pinned to the App version it started on, and acts for one person: whoever started it, or the App's owner for a trigger-started run. Workflow code imports **only** `@grasp-os/sdk`; it never imports the engine or any platform internals directly.
+Workflows are TypeScript programs that run durably on Cloudflare Workflows — an execution engine that persists the result of every step so a run can replay from where it left off after an interruption. Each workflow lives in an App's `workflows/` folder, is pinned to the App version it started on, and acts for one person: whoever started it, or the App's owner for a trigger-started run. Workflow code imports **only** `@grasp-os/sdk/workflow`; it never imports the engine or any platform internals directly.
 
 ## Defining a workflow
 
-A workflow is created with the `workflow` function from `@grasp-os/sdk`. It declares its ID, parameters, optional triggers, and a `run` function that executes steps in sequence:
+A workflow is created with the `workflow` function from `@grasp-os/sdk/workflow`. It declares its ID, parameters, optional triggers, and a `run` function that executes steps in sequence:
 
 ```typescript
-import { workflow, money, model, text } from "@grasp-os/sdk";
+import { workflow, money, model, text } from "@grasp-os/sdk/workflow";
 
 export default workflow(
   "invoice-approval",
@@ -57,7 +57,7 @@ The `run` function receives a `StepRunner` and a `WorkflowContext`. Every step a
     );
     ```
 
-    Set `sideEffect: true` when the step changes something outside Grasp. The step then receives an `idempotencyKey` (`runId:stepName`) to pass to connector calls, ensuring retries never duplicate side effects. Set `locked: true` for deterministic steps that must never involve a model.
+    Set `sideEffect: true` when the step changes something outside Grasp. The step then receives an `idempotencyKey` (unique per run and step) to pass to connector calls, ensuring retries never duplicate side effects. Set `locked: true` for deterministic steps that must never involve a model.
   </Tab>
   <Tab title="llm">
     The `step.llm` type calls a model through the model gateway. The answer must match the provided Zod `schema`; an answer that doesn't match is treated as a failure and retried.
@@ -124,7 +124,7 @@ The `run` function receives a `StepRunner` and a `WorkflowContext`. Every step a
 Parameters are tunable values that people can change without touching the code. Each is declared in the workflow's `params` object with a kind, a label, a default, and an optional `sensitive` flag.
 
 ```typescript
-import { workflow, money, number, text, person, schedule, model, template } from "@grasp-os/sdk";
+import { workflow, money, number, text, person, schedule, model, template } from "@grasp-os/sdk/workflow";
 
 export default workflow("weekly-report", {
   params: {

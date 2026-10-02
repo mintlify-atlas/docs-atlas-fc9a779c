@@ -1,7 +1,7 @@
 ---
-title: "Grasp OS Apps: Structure, Lifecycle, and Creation"
+title: "Grasp OS Apps: Structure, Lifecycle, and Creation API"
 sidebarTitle: "Overview"
-description: "Apps are versioned, isolated TypeScript programs deployed as Cloudflare Durable Objects. Learn their file layout, version lifecycle, and how to create one."
+description: "Apps are versioned TypeScript programs on Cloudflare Durable Objects. Learn their file layout, version lifecycle, and how to create and commit one."
 ---
 
 A Grasp OS **App** is a self-contained program that lives on your deployment. Its server runs as a Cloudflare Durable Object with its own SQLite database; its screens are sandboxed React components the browser renders in iframes; its workflows are durable, step-by-step automations. Everything — server code, screens, and workflows — is committed together as a single versioned tree of TypeScript files, so every deployed version is an immutable snapshot of the full program.
@@ -56,7 +56,7 @@ const app = await session.apps.create({
 });
 ```
 
-`create` takes a `NewApp` object — a `name` (required, up to 100 characters) and an optional `description` (up to 1 000 characters). It returns the new `App` record, which carries the App's `id`, `owner`, `currentVersion` (initially `null`), and `createdAt`.
+`create` takes a `NewApp` object with three fields: `name` (required, up to 100 characters), an optional `description` (up to 1 000 characters), and an optional `blueprint` label string that records what the App was made from. It returns the new `App` record, which carries the App's `id`, `owner`, `currentVersion` (initially `null`), and `createdAt`.
 
 Once an App exists, you commit its first version by writing files:
 

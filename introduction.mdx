@@ -56,7 +56,7 @@ Six workspace packages are shared across the apps:
 
 ## Platform pillars
 
-Grasp OS is built around seven platform pillars, each with its own section in these docs:
+Grasp OS is built around eight platform pillars, each with its own section in these docs:
 
 <CardGroup cols={2}>
   <Card title="Apps" icon="grid-2" href="/concepts/apps">
@@ -68,10 +68,10 @@ Grasp OS is built around seven platform pillars, each with its own section in th
   <Card title="Knowledge base" icon="book-open" href="/concepts/knowledge">
     A per-deployment D1 database that stores structured knowledge, surfaced to the AI agent and to Apps through the SDK.
   </Card>
-  <Card title="AI agent" icon="robot" href="/concepts/apps">
+  <Card title="AI agent" icon="robot" href="/architecture">
     The built-in agent uses the knowledge base, the model gateway, and the connector layer to answer questions and take actions on behalf of users.
   </Card>
-  <Card title="Model gateway" icon="microchip-ai" href="/concepts/apps">
+  <Card title="Model gateway" icon="microchip-ai" href="/platform/configuration">
     Every LLM call goes through Core's model gateway. It applies deployment rules — jurisdiction constraints, per-App model budgets, data sensitivity guards — before forwarding to Cloudflare AI Gateway.
   </Card>
   <Card title="Connectors" icon="plug" href="/concepts/connectors">

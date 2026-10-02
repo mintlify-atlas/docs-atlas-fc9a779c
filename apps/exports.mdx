@@ -1,7 +1,7 @@
 ---
-title: "App Exports: Typed Methods Other Apps Can Call"
+title: "App Exports: Declare Server Methods for Other Apps"
 sidebarTitle: "Exports"
-description: "app/exports.json declares the server methods other Apps may call under a permission. Learn the manifest format, read vs. write access, call limits, and idempotency."
+description: "app/exports.json declares the typed server methods other Apps may call under an admin-granted permission, with JSON Schema validation and call size limits."
 ---
 
 An App can expose a curated set of its server methods to other Apps. These **exports** are declared in `app/exports.json`, versioned alongside all other code, and accessed by callers through a typed stub from `@grasp-os/sdk/workflow`. Every call is checked by core: the export must exist in the current version, the calling App must hold a permission that allows the action, and the input and output must each match the declared JSON Schema. No export is reachable without an admin-granted permission.
@@ -94,7 +94,13 @@ export default workflow("create-order", { params: {} }, async (step, { env, inpu
 ```ts
 export type AppExportsStub<Exports> = {
   readonly [
-    Name in keyof Exports as /* method names core calls */
+    Name in keyof Exports as
+      // Excludes "read", "write", reserved names, and non-app-method names
+      Name extends "read" | "write"
+        ? never
+        : IsAppMethod<Name> extends true
+          ? Exports[Name] extends (input: never) => unknown ? Name : never
+          : never
   ]: Exports[Name] extends (input: infer Input) => infer Answer
     ? (input: Input) => Promise<Awaited<Answer>>
     : never;

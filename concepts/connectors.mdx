@@ -62,7 +62,7 @@ When a tool's `run` function calls `fetch`, the request doesn't go directly to t
 1. Checks the requested host against the connector's declared `hosts` list — requests to undeclared hosts are refused.
 2. Verifies the request matches one of the tool's declared `routes` — a route not listed in `routes` is refused.
 3. Adds the connection's OAuth token (Bearer or other scheme, depending on the provider) to the outgoing request.
-4. Enforces idempotency: a non-read-only call without a valid idempotency key is refused with `workflow.idempotency_key_invalid`.
+4. Enforces idempotency: a non-read-only call without a valid idempotency key is refused with `connect.idempotency_key_required`.
 5. Forwards the request and returns the response to the tool's `run` function.
 
 The token is **never in the isolate**. The connector code can only reach the provider through routes it declared, with a token it never sees. This satisfies threat model R9 in `AGENTS.md`.

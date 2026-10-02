@@ -41,6 +41,10 @@ This guide takes you from a fresh clone of the repository to a running local dev
     **`apps/core/.dev.vars`** (copy from `.dev.vars.example`):
 
     ```ini
+    # Shared with the router. vp run dev skips the router-secret check
+    # for localhost requests, so this may stay empty locally.
+    ROUTER_SECRET=
+
     # Signs session cookies and encrypts sign-in state.
     # Any random value of at least 32 characters.
     # Example: openssl rand -base64 32
@@ -50,10 +54,6 @@ This guide takes you from a fresh clone of the repository to a running local dev
     # Must match the value in apps/connect/.dev.vars.
     # Example: openssl rand -base64 32
     CAPABILITY_SIGNING_KEY=
-
-    # Shared with the router. vp run dev skips the router-secret check
-    # for localhost requests, so this may stay empty locally.
-    ROUTER_SECRET=
     ```
 
     **`apps/connect/.dev.vars`** (copy from `.dev.vars.example`):

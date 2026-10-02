@@ -1,5 +1,5 @@
 ---
-title: "StepRunner — All Four Step Methods in Full Detail"
+title: "StepRunner — do, llm, decision, and sleep Reference"
 sidebarTitle: "Steps"
 description: "do, llm, decision, and sleep: StepRunner's four durable methods, always one at a time. Full options, retry semantics, Duration type, and idempotency keys."
 ---
@@ -54,7 +54,7 @@ step.do(name, options, fn)
 </ParamField>
 
 <ParamField path="locked" type="boolean" optional>
-  When `true`, marks the step as deterministic with no model involvement — suitable for computing totals, account numbers, and reference strings. A `locked` step cannot also be `sideEffect`.
+  When `true`, marks the step as deterministic with no model involvement — suitable for computing totals, account numbers, and reference strings that must always come from a recorded result rather than code that may vary.
 </ParamField>
 
 <ParamField path="input" type="Json" optional>

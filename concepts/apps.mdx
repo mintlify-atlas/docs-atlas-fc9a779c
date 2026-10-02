@@ -19,7 +19,7 @@ workflows/report.ts ← Workflow named "report" (optional, repeatable)
 ```
 
 <Note>
-  Files are keyed by path. Segments must match `[\\w-][\\w.-]*` — no leading dots, no `..`, no backslashes. The full path may be at most 256 characters and four levels deep. The platform enforces this at commit time.
+  Files are keyed by path. Segments must match `[\\w-][\\w.-]*` — no leading dots, no `..`, no backslashes. The full path may be at most 200 characters and eight levels deep. The platform enforces this at commit time.
 </Note>
 
 Screens are named by their filename without the extension (`screens/inbox.tsx` → `"inbox"`). Workflows are named by their workflow ID declared in code, which must match the filename (`workflows/report.ts` → `"report"`).
@@ -107,7 +107,7 @@ export interface AppCaller {
 ```
 
 <Warning>
-  Methods named `toJSON`, `then`, `hasOwnProperty`, or any name in `reservedAppMethods` are never called by core, even if they match the pattern. The SDK's typed stub also leaves them out. Core returns `app.method_invalid` for any such call.
+  Methods whose names are in `reservedAppMethods` — `alarm`, `connect`, `constructor`, `delete`, `dup`, `fetch`, `get`, `hasOwnProperty`, `id`, `isPrototypeOf`, `name`, `propertyIsEnumerable`, `put`, `queue`, `scheduled`, `then`, `toLocaleString`, `toString`, `valueOf`, `webSocketClose`, `webSocketError`, `webSocketMessage` — are never called by core, even if they match the pattern. The SDK's typed stub also leaves them out. Core returns `app.method_invalid` for any such call.
 </Warning>
 
 ## The App sandbox
@@ -157,11 +157,11 @@ Each export has an `access` of `"read"` (the method only reads the App's data) o
 
 When the agent writes an App in **Code Mode**, it works in a draft tied to the current chat. It calls `files.commit` to build and check each version, reads back any diagnostics, and iterates until the code is clean. Once ready, it calls `versions.propose` to put the version up for a builder's review. The builder reads the diff, reviews the changed steps and permissions, and calls `versions.setCurrent` to deploy.
 
-The agent imports types from the App's own server file as `import type`, never the implementation, and calls server methods through the `appServer` helper from `@grasp-os/sdk`:
+The agent imports types from the App's own server file as `import type`, never the implementation, and calls server methods through the `appServer` helper from `@grasp-os/sdk/workflow`:
 
 ```typescript
 import type { App } from "../app/server.ts";
-import { appServer, workflow } from "@grasp-os/sdk";
+import { appServer, workflow } from "@grasp-os/sdk/workflow";
 
 export default workflow("update-status", { params: {} }, async (step, { env }) => {
   await step.do("update", { description: "Update the record", sideEffect: true }, async () => {

@@ -17,8 +17,8 @@ The monorepo contains five apps and six packages. Apps are Cloudflare Workers; p
 | `apps/core` | `grasp-os-core` | Sign-in, knowledge, Apps, workflow engine, model gateway, audit log — the main deployment unit per client |
 | `apps/connect` | `grasp-os-connect` | OAuth token vault, MCP servers, all egress to external systems; reached only through Core's service binding |
 | `apps/web` | *(static assets)* | React SPA, built by Vite and served as static files by Core through the `ASSETS` binding |
-| `apps/console` | *(grasp-os-ops)* | Staff console (TanStack Start) for provisioning and releases; runs in the Grasp Labs ops account |
-| `apps/router` | *(grasp-os-ops)* | Stateless hostname router mapping `*.<domain>` to each client's Core; also runs in the ops account |
+| `apps/console` | `grasp-os-console` | Staff console (TanStack Start) for provisioning and releases; runs in the Grasp Labs ops account |
+| `apps/router` | `grasp-os-router` | Stateless hostname router mapping `*.<domain>` to each client's Core; also runs in the ops account |
 
 ### Packages
 
@@ -40,7 +40,7 @@ User browser / API client
         │
         ▼
   ┌───────────┐
-  │  Router   │  grasp-os-ops
+  │  Router   │  grasp-os-router
   │  Worker   │  maps *.domain → client Core
   └─────┬─────┘
         │  ROUTER_SECRET header

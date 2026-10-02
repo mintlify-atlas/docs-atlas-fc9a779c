@@ -1,7 +1,7 @@
 ---
-title: "Deploying Grasp OS to a Client Cloudflare Account"
+title: "Deploying Grasp OS into a Client Cloudflare Account"
 sidebarTitle: "Deployment"
-description: "How Grasp OS is provisioned and deployed: one isolated Cloudflare deployment per client, in the EU, coordinated by the staff console."
+description: "How Grasp OS is provisioned and deployed: one isolated Cloudflare deployment per client, anchored to the EU, coordinated by the staff console."
 ---
 
 Grasp OS is deployed once per client, directly into the client's own Cloudflare account — never as a shared multi-tenant service. Each deployment is fully isolated: its own Workers, its own D1 databases, its own R2 buckets, and its own secrets. The staff console in `grasp-os-ops` (Grasp's own Cloudflare account) orchestrates every provisioning step and coordinates rolling releases across clients ring by ring. You never deploy to a client account manually from a local machine; the console is the only path.
@@ -131,8 +131,10 @@ These vars are set by the console through the Cloudflare API after deployment. B
 | `SIGN_IN` | core | Identity provider settings: Entra and Google OAuth client IDs, allowed domains. Without it, nobody can sign in. |
 | `MODEL_GATEWAY` | core | AI Gateway URL, allowed models, and model rules. Without it, core falls back to the account's default gateway and Workers AI models. |
 | `PLATFORM_CHANGE` | core | Who made this release and what changed. The cron records it in the audit log once per deployed version. |
-| `AUDIT_RETENTION_DAYS` | core | How long run details are kept. Default 180 days, minimum 30. |
-| `AUDIT_ARCHIVE_RETENTION_DAYS` | core | Age at which archived audit events are purged. Minimum 365 days and at least `AUDIT_RETENTION_DAYS`. Unset means archived events are never purged. |
+| `AUDIT_RETENTION_DAYS` | core | How long audit events remain searchable in the live log. Default 180 days, minimum 30. |
+| `AUDIT_ARCHIVE_RETENTION_DAYS` | core | Age at which archived audit events are purged from R2. Minimum 365 days and at least `AUDIT_RETENTION_DAYS`. Unset means archived events are never purged. |
+| `RUN_RETENTION_DAYS` | core | How long an ended workflow run keeps its detail record. Default 30 days, from 1 to 30. |
+| `MEMORY_LIMITS` | core | Per-App memory limits, set by the console. |
 
 <Info>
   These vars are intentionally absent from `wrangler.jsonc`. If they were listed there, every Wrangler deploy would overwrite the console's values. The `keep_vars: true` setting is what protects them.

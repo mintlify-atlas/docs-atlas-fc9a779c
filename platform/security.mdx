@@ -1,5 +1,5 @@
 ---
-title: "Grasp OS Security Architecture and Threat Model"
+title: "Grasp OS Security Architecture, Sandbox, and Permissions"
 sidebarTitle: "Security"
 description: "Sandbox isolation, connector egress controls, EU data jurisdiction, deny-by-default permissions, restricted data, audit integrity, and secrets management."
 ---
@@ -123,7 +123,7 @@ Grasp OS is deployed in the EU by default. Jurisdiction is set **at resource cre
     All Durable Objects use `jurisdiction("eu")` so their storage and compute are pinned to the EU.
   </Card>
   <Card title="D1 databases" icon="database">
-    D1 is created with the `eu` location hint (`weur`). The CI deploy script checks every database's jurisdiction before deploying and exits non-zero if any is outside the EU.
+    D1 databases are created with `--jurisdiction eu`. The CI deploy script checks every database's jurisdiction before deploying and exits non-zero if any is outside the EU.
   </Card>
 </CardGroup>
 

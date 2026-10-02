@@ -41,9 +41,9 @@ These vars are set by the console through the Cloudflare API. Because `keep_vars
 </ParamField>
 
 <ParamField body="AUDIT_RETENTION_DAYS" type="number" default="180">
-  How long a workflow run's detail records are kept before they are moved to the audit archive. Minimum value is 30 days. If unset, defaults to 180 days.
+  How long audit events remain searchable inside the `AuditLog` Durable Object before they are moved to the archive. Minimum value is 30 days; maximum is ten years. If unset, defaults to 180 days.
 
-  This controls active retention only — archived events follow `AUDIT_ARCHIVE_RETENTION_DAYS`.
+  This controls active (searchable) retention only — archived events are governed by `AUDIT_ARCHIVE_RETENTION_DAYS`.
 
   **Source:** `src/audit-log.ts`
 </ParamField>

@@ -120,16 +120,13 @@ A person or group that a `step.decision` step waits for answers from. The runtim
 person(options: {
   label: string;
   default: string;  // one of the three forms above
+  sensitive?: boolean;
 }): Param<'person'>
 ```
 
 ```ts
 approver: person({ label: 'Invoice approver', default: 'role:finance' }),
 ```
-
-<Note>
-  `person` params don't have a `sensitive` option — the value is a user ID or role name, never a secret.
-</Note>
 
 ---
 
@@ -200,7 +197,7 @@ emailTemplate: template({ label: 'Approval request template', default: 'invoice-
 
 ## sensitive
 
-Any param except `person` accepts `sensitive: true`. A sensitive parameter's value is **never written to the audit log**, regardless of what it contains. People set it the same way as any other param.
+Every param kind accepts `sensitive: true`. A sensitive parameter's value is **never written to the audit log**, regardless of what it contains. People set it the same way as any other param.
 
 ```ts
 apiSecret: text({

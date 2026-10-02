@@ -60,8 +60,7 @@ await step.do("send-reply", {
     to: [input.to],
     subject: input.subject,
     body: input.body,
-    idempotencyKey,
-  });
+  }, { idempotencyKey });
 });
 ```
 
