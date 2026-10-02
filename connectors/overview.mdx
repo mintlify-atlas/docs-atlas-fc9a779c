@@ -1,0 +1,142 @@
+---
+title: "Connector Layer: External Integrations in Grasp OS"
+sidebarTitle: "Overview"
+description: "How Grasp OS routes every external call through the Connect Worker, manages OAuth connections, and delivers real-time events to workflow triggers."
+---
+
+Every request that leaves a Grasp OS deployment — an email sent, a file read, a calendar event created — travels through a single choke point: the **Connect Worker** (`apps/connect`). No workflow isolate ever holds a provider token; no outbound HTTP call bypasses Connect's egress. This design is not a convention but a hard architectural constraint: the connector's own isolate can only reach the URLs it declared, and the token is added by Connect's egress handler after it validates the request against the tool's manifest. The result is a clear, auditable boundary between what an App is *allowed* to do and what it has actually done.
+
+## The Connect Worker
+
+`apps/connect` is the sole egress point for the entire platform. It owns:
+
+- **OAuth tokens** — acquired via PKCE flows, refreshed automatically, never exposed to any other Worker or isolate.
+- **MCP servers** — each native connector runs as a stateless JSON-RPC 2.0 server inside its own isolate, reached by Connect over a service binding.
+- **Egress rules** — per-tool HTTP route allowlists enforced before any token is attached.
+- **Capability tokens** — signed, short-lived tokens Core gives Connect for exactly one call, binding the connection, resource, action, and idempotency key.
+- **Connector events** — an outbox that Core polls to deliver events to workflow triggers.
+
+Core and Connect communicate over a Cloudflare service binding (`CONNECT`), which means no network hop, no ambient credentials, and no way for a connector tool's code to widen the set of hosts it may reach.
+
+## The MCP Protocol
+
+Connect speaks to each native connector using the **Model Context Protocol (MCP)**, revision `2025-06-18`, over Streamable HTTP with JSON responses. The protocol is JSON-RPC 2.0 — every request carries `jsonrpc: "2.0"`, a method such as `tools/list` or `tools/call`, and an `id`. Responses are plain JSON objects with `result` on success or `error` on failure. Connectors are **stateless**: a fresh isolate may serve each request, and Connect never relies on any state surviving between calls.
+
+The methods Connect uses are:
+
+| Method | Purpose |
+|---|---|
+| `initialize` | Handshake; returns the server's name, version, and capabilities |
+| `ping` | Keep-alive check |
+| `tools/list` | Enumerate all tools with their schemas and annotations |
+| `tools/call` | Invoke one tool by exact name with a JSON argument object |
+
+## Connections
+
+A **Connection** is an OAuth-linked account that has been authorized to act on behalf of a user or an organization. Every Connection has a scope:
+
+- **Personal** — the signed-in person's own account (e.g. their own Microsoft 365 mailbox). Only calls acting for that person may use it.
+- **Shared** — an account an admin connected on behalf of the organization (e.g. `invoices@acme.com`). Permissions decide which Apps and users may call it.
+
+Connections are managed by admins in the Connections section of the deployment's settings. A connection that needs its token refreshed enters a `needs_reauth` state and must be reconnected before it can be called again.
+
+<Note>
+  Grasp staff cannot connect accounts in a client deployment. Only the organization's own admins and users (for personal connections) may do so.
+</Note>
+
+## Calling a Connection from a Workflow
+
+A workflow calls a connection through a **permission binding**. When an admin approves an App's version, they grant it one or more permissions — each naming a connection (and optionally a resource within it, such as a specific mailbox) and the action the App may call. The App's workflow code sees each approved permission as a binding on `env`, named by the binding name the App declared:
+
+```ts
+// In a side-effect step, env.INBOX is the bound connection.
+await step.do("send-reply", {
+  description: "Send the reply email",
+  sideEffect: true,
+  input: { to, subject, body },
+}, async ({ idempotencyKey, input }) => {
+  await env.INBOX.call("mail.send", {
+    mailbox: "invoices@acme.com",
+    to: [input.to],
+    subject: input.subject,
+    body: input.body,
+    idempotencyKey,
+  });
+});
+```
+
+`env.INBOX` above is a typed binding that reaches the `INBOX` connection. The idempotency key — derived from the run ID and step name — ensures that a retried step never sends the email twice. Core makes a capability token for the exact call (connection, action, resource, key) and passes it to Connect, which validates it before attaching the provider token and forwarding the request.
+
+## Connector Events
+
+Connect can **poll or subscribe** to a provider and deliver real-time events into a workflow trigger. The flow is:
+
+1. Core calls `syncEventSources` with the full list of active listeners (App + connection + resource + event type). Connect starts listening where it wasn't, and stops where no listener remains.
+2. Connect reads changed sources on its own schedule and writes events into its outbox.
+3. Core polls the outbox with `takeConnectorEvents`, processes each event, and acknowledges with `ackConnectorEvents`.
+4. Core delivers matched events to the workflow runs they start, acting for the App's owner.
+
+Events are deduplicated: the same event delivered twice starts only one run. Each event type is gated by the read action it carries — an App hears `m365.mail.received` only if it holds a permission allowing `mail.list` on that connection.
+
+```ts
+export default workflow("new-invoice-handler", {
+  params: {},
+  triggers: [{ type: "event", event: "m365.mail.received", filter: { folder: "inbox" } }],
+  input: connectorEvent,
+}, async (step, { input }) => {
+  // input.payload holds the event fields: mailbox, id, subject, from, …
+  await step.do("process", { description: "Process the invoice email" }, async () => {
+    // ...
+  });
+});
+```
+
+## Security Model
+
+The connector security model is built on four principles:
+
+**No token in the isolate.** A connector's `run` function calls `fetch` with a plain URL; the isolate never sees the OAuth token. Connect's egress handler intercepts the request, checks it against the tool's declared routes, and adds the token before forwarding.
+
+**Egress rules per tool.** Each tool declares the exact HTTP routes it may use — method, host, and path template. A path parameter named after the tool's `resource` property (e.g. `{mailbox}`) is bound to the resource named in the call's capability, so a tool that declares `GET /v1/users/{mailbox}/messages` can only read the specific mailbox the permission names.
+
+**Capability tokens.** Core creates a short-lived, cryptographically signed capability for every call — binding the connection ID, resource, action name, and idempotency key. Connect verifies the capability before doing anything, ensuring that a replayed or misrouted call can do nothing.
+
+**Strict input schemas.** Every tool's `input` must be a `z.strictObject` all the way down. Unknown keys are rejected, not dropped, so no alias or hidden key can select a different resource than the one the permission names.
+
+## Supported Native Connectors
+
+Grasp OS ships two native connectors that Connect runs directly, with tokens it holds:
+
+<CardGroup cols={2}>
+  <Card
+    title="Microsoft 365"
+    icon="microsoft"
+    href="/connectors/native#microsoft-365"
+  >
+    Mail, files (OneDrive and SharePoint), and calendar via Microsoft Graph. Events: `m365.mail.received`, `m365.file.created`.
+  </Card>
+  <Card
+    title="Google Workspace"
+    icon="google"
+    href="/connectors/native#google-workspace"
+  >
+    Gmail, Drive (shared drives), and Calendar via Google APIs. Events: `google.mail.received`, `google.file.created`.
+  </Card>
+</CardGroup>
+
+<CardGroup cols={2}>
+  <Card
+    title="Building Connectors"
+    icon="wrench"
+    href="/connectors/building"
+  >
+    Write your own native connector with `@grasp-os/connector-kit`: define tools, handle errors, and assemble an MCP server.
+  </Card>
+  <Card
+    title="Native Connector Reference"
+    icon="book"
+    href="/connectors/native"
+  >
+    Full tool listings and event payload schemas for the built-in Microsoft 365 and Google Workspace connectors.
+  </Card>
+</CardGroup>

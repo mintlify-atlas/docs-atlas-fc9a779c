@@ -1,0 +1,321 @@
+---
+title: "Screen SDK — Calling the Server and Following Workflows"
+sidebarTitle: "Screen SDK"
+description: "callServer, useLive, useWorkflow, and useRun from @grasp-os/sdk/screen let sandboxed App screens call server methods and follow workflow runs in real time."
+---
+
+App screens run in sandboxed iframes and have no direct network access — all communication with the App's server goes through `@grasp-os/sdk/screen`. Every call is proxied through the surrounding page to Core, which verifies the person's session and role before invoking the server method. The session check happens on every call; there is no cached credential in the screen.
+
+```ts
+import { callServer, useLive, useWorkflow, useRun } from '@grasp-os/sdk/screen';
+```
+
+---
+
+## callServer
+
+A one-shot async call to a named method on the App's server. Resolves with the method's return value. Rejects on error with an object containing a `code` field.
+
+```ts
+callServer<Answer = unknown>(method: string, ...args: unknown[]): Promise<Answer>
+```
+
+<ParamField path="method" type="string" required>
+  The server method name. Must match an exported method on the App's `DurableObject` class that Core allows calls to (starts with a lowercase letter, letters and digits only, not reserved).
+</ParamField>
+
+<ParamField path="args" type="unknown[]" optional>
+  Arguments forwarded to the server method. Must be plain data (JSON-serialisable).
+</ParamField>
+
+```tsx
+import { callServer } from '@grasp-os/sdk/screen';
+
+async function addNote(text: string) {
+  await callServer('addNote', text);
+}
+
+// With typed response
+const notes = await callServer<string[]>('getNotes');
+```
+
+On error the promise rejects with an object whose `code` explains the failure. `app.failed` means the server method itself threw.
+
+---
+
+## useLive
+
+A React hook that subscribes to a server method that pushes updates. Returns `initial` until the first value arrives; resubscribes automatically when the connection drops and comes back.
+
+```ts
+useLive<Value>(method: string, initial: Value, ...args: unknown[]): Value
+```
+
+<ParamField path="method" type="string" required>
+  The server method name. The method must accept a callback as its last argument, call it with the current value immediately, and call it again whenever the value changes.
+</ParamField>
+
+<ParamField path="initial" type="Value" required>
+  The value returned until the first update from the server.
+</ParamField>
+
+<ParamField path="args" type="unknown[]" optional>
+  Additional arguments forwarded to the server method before the callback. A change in `args` (compared by JSON equality) unsubscribes the old subscription and starts a new one.
+</ParamField>
+
+```tsx
+import { callServer, useLive } from '@grasp-os/sdk/screen';
+
+export default function Notes() {
+  const notes = useLive<string[]>('watchNotes', []);
+
+  return (
+    <div>
+      <ul>{notes.map((n, i) => <li key={i}>{n}</li>)}</ul>
+      <button onClick={() => void callServer('addNote', 'Call Acme')}>
+        Add note
+      </button>
+    </div>
+  );
+}
+```
+
+The subscription backs off to retrying every 30 seconds if reconnection repeatedly fails. When the component unmounts, the subscription is stopped and the server drops the callback.
+
+---
+
+## live
+
+The imperative equivalent of `useLive` — for use outside React components. Returns a stop function.
+
+```ts
+live(method: string, args: readonly unknown[], onChange: (value: unknown) => void): () => void
+```
+
+<ParamField path="method" type="string" required>
+  The server method to subscribe to.
+</ParamField>
+
+<ParamField path="args" type="readonly unknown[]" required>
+  Arguments forwarded to the server method before the callback. Pass `[]` when there are none.
+</ParamField>
+
+<ParamField path="onChange" type="(value: unknown) => void" required>
+  Called with every value the server sends. Also called on reconnect (so you can refresh from the latest state).
+</ParamField>
+
+```ts
+const stop = live('watchNotes', [], (notes) => {
+  console.log('Notes updated:', notes);
+});
+
+// Later:
+stop();
+```
+
+---
+
+## useWorkflow
+
+A React hook that gives a screen access to one of the App's workflows: its runs (live), and actions to start runs, check their status, and answer decisions. Core checks the person's role on every call.
+
+```ts
+useWorkflow(workflow: string): {
+  runs: ScreenRun[];
+  start: (input?: unknown) => Promise<WorkflowRun>;
+  status: (run: string) => Promise<ScreenRun>;
+  decide: (run: string, decision: string, answer: DecisionAnswer) => Promise<void>;
+}
+```
+
+<ParamField path="workflow" type="string" required>
+  The workflow's ID as declared in `workflow(id, …)`.
+</ParamField>
+
+### Return value
+
+<ParamField path="runs" type="ScreenRun[]">
+  The workflow's runs, **newest first**, live — updated each time a run starts, changes state, or ends. Empty until the first read. At most 100 runs are kept in memory; older runs are accessible via `status` by ID.
+</ParamField>
+
+<ParamField path="start" type="(input?) => Promise<WorkflowRun>">
+  Starts a new run, acting as the signed-in person. Pass `input` when the workflow declares `config.input`.
+</ParamField>
+
+<ParamField path="status" type="(run: string) => Promise<ScreenRun>">
+  Reads the current state of one run by its ID, including `output` for completed runs (visible to the starter and admins only).
+</ParamField>
+
+<ParamField path="decide" type="(run, decision, answer) => Promise<void>">
+  Answers a decision the run is waiting for. `decision` is the step name passed to `step.decision`. `answer` is a `DecisionAnswer` — see below. Rejects with `decision.forbidden` if the person may not answer, or `decision.closed` if the decision already ended.
+</ParamField>
+
+<Note>
+  Each call to `useWorkflow` or `useRun` that needs a live subscription uses one of the screen's **20 subscription slots**. All components calling `useWorkflow` with the same workflow ID share one slot. Components following different workflow IDs, or individual runs with `useRun`, each need their own slot. Plan screen layouts to stay within the limit.
+</Note>
+
+```tsx
+import { useWorkflow } from '@grasp-os/sdk/screen';
+
+export default function InvoiceQueue() {
+  const intake = useWorkflow('invoice-intake');
+
+  return (
+    <div>
+      <button onClick={() => void intake.start({ vendor: 'Acme' })}>
+        Submit invoice
+      </button>
+
+      {intake.runs.map((run) => (
+        <div key={run.id}>
+          <span>{run.status}</span>
+          {run.waitingFor.map((decision) => (
+            <div key={decision.name}>
+              <span>{decision.description}</span>
+              <button
+                onClick={() =>
+                  void intake.decide(run.id, decision.name, { approved: true })
+                }
+              >
+                Approve
+              </button>
+              <button
+                onClick={() =>
+                  void intake.decide(run.id, decision.name, {
+                    approved: false,
+                    payload: { reason: 'Over budget' },
+                  })
+                }
+              >
+                Reject
+              </button>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+---
+
+## useRun
+
+A React hook that follows one run by its ID — including runs older than the 100 tracked by `useWorkflow`. Returns `undefined` while loading, `null` when not found or not visible to the current person.
+
+```ts
+useRun(workflow: string, run: string): ScreenRun | null | undefined
+```
+
+<ParamField path="workflow" type="string" required>
+  The workflow ID.
+</ParamField>
+
+<ParamField path="run" type="string" required>
+  The run's ID.
+</ParamField>
+
+```tsx
+import { useRun } from '@grasp-os/sdk/screen';
+
+function RunDetail({ runId }: { runId: string }) {
+  const run = useRun('invoice-intake', runId);
+
+  if (run === undefined) return <span>Loading…</span>;
+  if (run === null) return <span>Run not found</span>;
+
+  return <span>Status: {run.status}</span>;
+}
+```
+
+---
+
+## followRuns / followRun
+
+Imperative equivalents of `useWorkflow` and `useRun` for use outside React components.
+
+```ts
+followRuns(workflow: string, onRuns: (runs: ScreenRun[]) => void): () => void
+followRun(workflow: string, run: string, onRun: (run: ScreenRun | null) => void): () => void
+```
+
+Both return a stop function. `onRuns` is called with the full list whenever any run changes; `onRun` is called with the single run (or `null`) each time. Failed reads are retried with backoff up to every 30 seconds; a newer read always supersedes an older one.
+
+```ts
+const stop = followRuns('invoice-intake', (runs) => {
+  console.log(`${runs.length} runs`);
+});
+
+// Later:
+stop();
+```
+
+---
+
+## Types
+
+### ScreenRun
+
+A run as a screen sees it. Extends `WorkflowRun` with live decision state.
+
+```ts
+interface ScreenRun extends WorkflowRun {
+  waitingFor: WaitingDecision[];
+}
+```
+
+`waitingFor` is empty once the run has ended. Each entry is a decision the run is currently blocked on.
+
+### WorkflowRun
+
+```ts
+interface WorkflowRun {
+  id: string;
+  workflow: string;
+  version: number;
+  startedBy: { type: 'person'; userId: string } | { type: 'trigger' };
+  status: RunStatus;
+  createdAt: string;   // ISO 8601
+  endedAt: string | null;
+  output?: unknown;    // set on completion; only for starter and admins
+  failure?: {
+    step: string | null;
+    error: { code: string; message: string };
+  };
+  detailsRemoved?: true;
+}
+```
+
+`detailsRemoved` is set once the run's 30-day retention ends. The run stays in the list but its `output` and `failure` details are gone.
+
+### RunStatus
+
+```ts
+type RunStatus =
+  | 'running'    // executing a step or sleeping
+  | 'waiting'    // blocked on a step.decision
+  | 'paused'     // engine instance suspended
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+```
+
+### WaitingDecision
+
+```ts
+interface WaitingDecision {
+  name: string;          // step name from step.decision(name, …)
+  description?: string;  // only for starter, admins, and eligible answerers
+  expiresAt: string;     // ISO 8601 deadline
+}
+```
+
+### DecisionAnswer
+
+```ts
+interface DecisionAnswer {
+  approved: boolean;
+  payload?: Json;  // anything extra the workflow asks for, e.g. { comment }; max 4 KiB
+}
+```

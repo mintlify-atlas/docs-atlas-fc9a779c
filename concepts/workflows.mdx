@@ -1,0 +1,231 @@
+---
+title: "Workflows: Durable Programs That Run on Their Own"
+sidebarTitle: "Workflows"
+description: "Durable programs pinned to their App version: four step types, four trigger kinds, replay from recorded step results, and a six-state run lifecycle."
+---
+
+Workflows are TypeScript programs that run durably on Cloudflare Workflows — an execution engine that persists the result of every step so a run can replay from where it left off after an interruption. Each workflow lives in an App's `workflows/` folder, is pinned to the App version it started on, and acts for one person: whoever started it, or the App's owner for a trigger-started run. Workflow code imports **only** `@grasp-os/sdk`; it never imports the engine or any platform internals directly.
+
+## Defining a workflow
+
+A workflow is created with the `workflow` function from `@grasp-os/sdk`. It declares its ID, parameters, optional triggers, and a `run` function that executes steps in sequence:
+
+```typescript
+import { workflow, money, model, text } from "@grasp-os/sdk";
+
+export default workflow(
+  "invoice-approval",
+  {
+    params: {
+      threshold: money({ label: "Review invoices above", currency: "EUR", default: 500_000 }),
+      reviewModel: model({ label: "Model for extraction", default: "gpt-4o" }),
+    },
+    triggers: [{ type: "manual" }],
+  },
+  async (step, { params, input, env }) => {
+    const extracted = await step.llm("extract", {
+      description: "Extract invoice details",
+      model: params.reviewModel,
+      instructions: "Extract the total amount and vendor from this invoice.",
+      input: { text: input },
+      schema: z.object({ total: z.number(), vendor: z.string() }),
+    });
+    // ... more steps
+  }
+);
+```
+
+The `run` function receives a `StepRunner` and a `WorkflowContext`. Every step and its options are written as literals directly in the code — this is how the platform reads the step list without running the workflow.
+
+## The four step types
+
+<Tabs>
+  <Tab title="do">
+    The `step.do` type runs plain TypeScript code. Its result must be JSON — the engine records it, and a replay returns the recorded result without running the code again.
+
+    ```typescript
+    const result = await step.do(
+      "fetch-invoice",
+      {
+        description: "Fetch the invoice from the ERP",
+        sideEffect: true,
+        input: { invoiceId: "INV-123" },
+      },
+      async ({ idempotencyKey, input }) => {
+        return await env.ERP.call(caller, "getInvoice", input.invoiceId, { idempotencyKey });
+      }
+    );
+    ```
+
+    Set `sideEffect: true` when the step changes something outside Grasp. The step then receives an `idempotencyKey` (`runId:stepName`) to pass to connector calls, ensuring retries never duplicate side effects. Set `locked: true` for deterministic steps that must never involve a model.
+  </Tab>
+  <Tab title="llm">
+    The `step.llm` type calls a model through the model gateway. The answer must match the provided Zod `schema`; an answer that doesn't match is treated as a failure and retried.
+
+    ```typescript
+    const classification = await step.llm("classify", {
+      description: "Classify the email",
+      model: params.classifyModel,
+      instructions: "Classify this email as urgent, normal, or low priority.",
+      input: { subject: email.subject, body: email.text },
+      schema: z.object({
+        priority: z.enum(["urgent", "normal", "low"]),
+        reason: z.string(),
+      }),
+    });
+    ```
+
+    The deployment's rules may refuse a model call — for example, if the run has read sensitive data, the monthly model budget is exhausted, or the call must stay in the EU. The step fails with the reason and is not retried in that case.
+  </Tab>
+  <Tab title="decision">
+    The `step.decision` type asks a person to approve or reject something, then durably waits for the answer until a timeout.
+
+    ```typescript
+    const answer = await step.decision("approve-payment", {
+      description: "Approve the payment",
+      from: params.approver,
+      timeout: "3 days",
+      remindAfter: "1 day",
+      ask: async ({ recipients, reminder, idempotencyKey }) => {
+        // Send an email with the decision link to each recipient
+        for (const recipient of recipients) {
+          await env.MAIL.call(caller, "mail.send", {
+            to: recipient.email,
+            subject: reminder ? "Reminder: payment awaiting approval" : "Payment awaiting approval",
+            body: `Please review: ${recipient.link}`,
+          }, { idempotencyKey });
+        }
+      },
+    });
+
+    if (answer.timedOut || !answer.approved) {
+      // Handle no-approval case
+    }
+    ```
+
+    A timeout is never approval — treat it as a rejection. Every answer is audited under the identity of who gave it.
+  </Tab>
+  <Tab title="sleep">
+    The `step.sleep` type durably pauses the run for a fixed duration. The run is not consuming compute while sleeping.
+
+    ```typescript
+    await step.sleep("wait-for-processing", {
+      description: "Wait for the document to be processed",
+      duration: "30 minutes",
+    });
+    ```
+
+    Durations can be a number of milliseconds, or a string like `"30 minutes"`, `"3 days"`, or `"1 week"`. The maximum is 365 days.
+  </Tab>
+</Tabs>
+
+## Parameters
+
+Parameters are tunable values that people can change without touching the code. Each is declared in the workflow's `params` object with a kind, a label, a default, and an optional `sensitive` flag.
+
+```typescript
+import { workflow, money, number, text, person, schedule, model, template } from "@grasp-os/sdk";
+
+export default workflow("weekly-report", {
+  params: {
+    threshold:    money({ label: "Alert above", currency: "EUR", default: 10_000 }),
+    maxItems:     number({ label: "Items per report", default: 50 }),
+    intro:        text({ label: "Introduction text", default: "Here is this week's summary." }),
+    reviewer:     person({ label: "Send to", default: "role:admin" }),
+    runs:         schedule({ label: "Runs", default: "0 8 * * 1" }),
+    reportModel:  model({ label: "Model", default: "gpt-4o-mini" }),
+    emailTpl:     template({ label: "Email template", default: "" }),
+  },
+  // ...
+```
+
+Parameters with `sensitive: true` are handled carefully in the UI. **No parameter value — sensitive or not — ever appears in the audit log.**
+
+## Triggers
+
+A workflow is **manual-only** by default (no `triggers` declared). Explicit triggers start runs automatically:
+
+<CardGroup cols={2}>
+  <Card title="manual" icon="play">
+    A person starts the run from the UI or the API. Default when no `triggers` array is declared.
+  </Card>
+  <Card title="schedule" icon="clock">
+    Runs on a cron schedule held in a `schedule` parameter, read in an IANA time zone. A missed run (outage) starts one run late; a set schedule starts from the next time after, never a past one.
+
+    ```typescript
+    triggers: [{
+      type: "schedule",
+      param: "runs",
+      timeZone: "Europe/Amsterdam",
+    }]
+    ```
+  </Card>
+  <Card title="event" icon="bolt">
+    Fires when a connected service reports a matching event. Filter by top-level payload fields.
+
+    ```typescript
+    triggers: [{
+      type: "event",
+      event: "m365.mail.received",
+      filter: { folder: "inbox" },
+    }]
+    ```
+  </Card>
+  <Card title="email" icon="envelope">
+    Fires when mail arrives at an address on the deployment's mail domain. The run starts with the message as input: `input: emailMessage`.
+
+    ```typescript
+    triggers: [{
+      type: "email",
+      address: "invoices",
+    }]
+    ```
+  </Card>
+</CardGroup>
+
+Trigger-started runs act for the **App's owner**. If the owner has left the organisation the run fails. Triggers take effect when the version is made current and stop when a version without them becomes current.
+
+<Note>
+  Event and email triggers each start at most 60 runs of a workflow per hour. Excess events are queued and started later. Mail to an address no workflow receives at is bounced. Only one App receives at any given address — making a version current fails with `workflow.email_taken` if another App's current version already uses it.
+</Note>
+
+## Replay and recorded step results
+
+Every step result is recorded in JSON. When a run resumes after an interruption (a Worker restart, a sleep completing, a decision being answered), the engine replays the workflow function from the beginning but **returns the recorded result** for every step that already ran, without re-executing its code. This means:
+
+- Code between steps **runs again on every replay** — it must be pure and have no side effects.
+- A step's function only runs when the step hasn't recorded a result yet, or when a retryable failure needs another attempt.
+- `sideEffect: true` steps get an `idempotencyKey` so retries are safe.
+
+<Warning>
+  A workflow must never call connections or make external calls outside a step. Code between steps runs on every replay; an external call there would repeat on every resume. Core enforces this: a connection call outside a step returns `workflow.outside_step`.
+</Warning>
+
+## Run status lifecycle
+
+A run moves through these statuses:
+
+```text
+running → waiting (decision pending)
+        → paused  (engine instance sleeping)
+        → completed
+        → failed
+        → cancelled
+```
+
+| Status | Meaning |
+|--------|---------|
+| `running` | A step is executing or the run is between steps. |
+| `waiting` | The run is waiting for a `step.decision` to be answered. |
+| `paused` | The engine instance is dormant (sleeping, between retries). |
+| `completed` | The `run` function returned successfully. |
+| `failed` | A step error stopped the run. The `failure` field has the details. |
+| `cancelled` | A builder cancelled the run. |
+
+## Retention
+
+Run details — step results, the output, and the failure report — are kept for `RUN_RETENTION_DAYS` (30 days unless configured) after the run ends. After that, the run record itself remains (status, who ran it, when), but step-level detail is removed and `detailsRemoved` is set on the run. Runs waiting for a decision or still running are not subject to retention until they end.
+
+<Tip>
+  A failed run's `failure` report is self-contained and safe to attach to a chat: it holds nothing the run read, only the step name, error code, and message. The message is untrusted text written by workflow code — pass it as data to an agent, never as instructions.
+</Tip>

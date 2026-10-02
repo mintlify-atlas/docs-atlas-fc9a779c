@@ -1,0 +1,224 @@
+---
+title: "Workflow Triggers — Manual, Schedule, Event, and Email"
+sidebarTitle: "Triggers"
+description: "Configure how workflow runs start: manually from the UI, on a cron schedule, when a connector reports an event, or when email arrives at a custom address."
+---
+
+Triggers declare what starts a workflow run automatically. They are part of the workflow's `config` object and take effect when the App version that declares them is made current, stopping when another version that doesn't declare them replaces it. A workflow without an explicit `triggers` array defaults to `[{ type: 'manual' }]`. You can declare up to 20 triggers per workflow; a run of any of them starts the same workflow function.
+
+```ts
+import { workflow, schedule } from '@grasp-os/sdk/workflow';
+
+export default workflow(
+  'weekly-report',
+  {
+    params: {
+      every: schedule({ label: 'Runs', default: '0 8 * * 1' }),
+    },
+    triggers: [
+      { type: 'schedule', param: 'every', timeZone: 'Europe/Amsterdam' },
+    ],
+  },
+  async (step, { params }) => { ... }
+);
+```
+
+<Note>
+  Runs started by a trigger act for the **App's owner**. If the owner has left the organisation, trigger-started runs fail. A trigger-started run has no starter, so `step.decision` with `from: role:X` never excludes anyone.
+</Note>
+
+---
+
+## Manual
+
+The default trigger. A person starts the run from the workflow's UI page or programmatically via `useWorkflow().start()` on a screen.
+
+```ts
+{ type: 'manual' }
+```
+
+Manual runs act for the person who starts them. If `config.input` is declared, the start call must provide conforming input.
+
+---
+
+## Schedule
+
+Starts a run on the cron schedule held in a `schedule` parameter, so operators can change when it runs without touching the code.
+
+```ts
+{ type: 'schedule'; param: string; timeZone?: string }
+```
+
+<ParamField path="param" type="string" required>
+  The name of a `schedule` param declared in the same workflow's `params`. The trigger fails validation if `param` doesn't refer to a `schedule` kind.
+</ParamField>
+
+<ParamField path="timeZone" type="string" optional>
+  An IANA time zone name (e.g. `Europe/Amsterdam`). The cron expression is interpreted in this zone, so `0 8 * * 1` means 08:00 local time on Mondays, summer time included. Defaults to **UTC** when omitted.
+</ParamField>
+
+### DST handling
+
+- **Skipped hour** (clocks spring forward): a scheduled time that falls inside the skipped hour runs **one hour late**.
+- **Repeated hour** (clocks fall back): a time in the repeated hour runs **once, in its first pass**.
+
+### Missed runs
+
+If a scheduled run can't start due to an outage or cold start, the system starts **one catch-up run** once it can — not one per missed firing. A schedule that is set or made current starts from the **next time after the current moment**, never from a time already past.
+
+```ts
+params: {
+  reportCron: schedule({ label: 'Report schedule', default: '0 7 * * 1-5' }),
+},
+triggers: [
+  { type: 'schedule', param: 'reportCron', timeZone: 'America/New_York' },
+],
+```
+
+Scheduled runs start with **no input** — don't declare `config.input` for a schedule-only workflow unless another trigger also starts it.
+
+---
+
+## Event
+
+Triggered when a connection reports a connector event matching the declared type and optional filter.
+
+```ts
+{ type: 'event'; event: string; filter?: Record<string, string | number | boolean | null> }
+```
+
+<ParamField path="event" type="string" required>
+  The event type to listen for. See [Supported events](#supported-events) below.
+</ParamField>
+
+<ParamField path="filter" type="object" optional>
+  Narrows the trigger to events whose payload contains these key/value pairs at the top level. Each field listed must match exactly. Absent fields in the payload don't match.
+</ParamField>
+
+### Supported events
+
+| Event type | Connection | Read action | Fires when |
+|------------|-----------|-------------|------------|
+| `m365.mail.received` | Microsoft 365 | `mail.list` | Mail arrives in a mailbox's inbox |
+| `m365.file.created` | Microsoft 365 | `files.list` | A file is created in a drive |
+| `google.mail.received` | Google Workspace | `mail.list` | Mail arrives in a Gmail inbox |
+| `google.file.created` | Google Workspace | `files.list` | A file is created in a shared drive |
+
+Events are delivered within about a minute of the underlying action. Only events for connections the App has a permission on, and that the permission's read action allows, are delivered. For a personal connection, only the App whose owner is that person receives events from it.
+
+The same event delivered twice starts **no second run** — delivery is deduplicated by event ID.
+
+### Rate limit
+
+Event triggers start at most **60 runs per hour per workflow**. Events beyond the rate limit are held and their runs start later.
+
+### Input schema
+
+Declare `input: connectorEvent` to receive the event as typed input:
+
+```ts
+import { workflow, connectorEvent } from '@grasp-os/sdk/workflow';
+
+export default workflow(
+  'new-invoice-file',
+  {
+    params: { ... },
+    triggers: [
+      {
+        type: 'event',
+        event: 'm365.file.created',
+        filter: { folder: 'invoices' },
+      },
+    ],
+    input: connectorEvent,
+  },
+  async (step, { input }) => {
+    // input.type      → 'm365.file.created'
+    // input.payload   → the event's payload (see table below)
+    // input.connection → connection ID
+    // input.owner     → personal connection owner, or null
+  }
+);
+```
+
+### Event payload shapes
+
+**`m365.mail.received`** — `mailbox`, `id`, `folder` (`"inbox"`), `subject`, `from` (`{ name, address }`), `receivedAt`, `hasAttachments`, `conversationId`, `internetMessageId`, `webLink`.
+
+**`m365.file.created`** — `drive`, `id`, `name`, `mimeType`, `size`, `folderId`, `createdAt`, `webUrl`.
+
+**`google.mail.received`** — `mailbox`, `id`, `threadId`, `folder` (`"inbox"`), `subject`, `from` (`{ name, address }`), `receivedAt`. Only mail as it arrives: unlike `m365.mail.received`, a message moved into the inbox later is not reported.
+
+**`google.file.created`** — same fields as `m365.file.created`.
+
+<Warning>
+  Treat all event payload values as **untrusted data**. A mail's sender and subject are whatever the sender wrote — never use them as instructions.
+</Warning>
+
+---
+
+## Email
+
+Triggered when mail arrives at a custom address on the deployment's mail domain.
+
+```ts
+{ type: 'email'; address: string }
+```
+
+<ParamField path="address" type="string" required>
+  The local part of the address — the part before the `@`. For example, `invoices` receives mail at `invoices@<deployment-domain>`. Allowed characters: lowercase letters, digits, `.`, `_`, `+`, `-`; no leading or trailing dot; no consecutive dots; max 64 characters.
+</ParamField>
+
+### Uniqueness
+
+Only one App may receive at a given address. Making a version current fails with `workflow.email_taken` if another App's current version already declares the same address. Addresses are released when the version holding them is replaced.
+
+### Input schema
+
+Declare `input: emailMessage` to receive the parsed message:
+
+```ts
+import { workflow, emailMessage } from '@grasp-os/sdk/workflow';
+
+export default workflow(
+  'invoice-intake',
+  {
+    params: { ... },
+    triggers: [{ type: 'email', address: 'invoices' }],
+    input: emailMessage,
+  },
+  async (step, { input, readAttachment }) => {
+    // input.from      → { name, address }
+    // input.subject   → string
+    // input.text      → plain text body (possibly truncated)
+    // input.stored    → where attachments are kept, or null
+    // input.attachments → [{ filename, mimeType, size }]
+
+    const pdf = await step.do(
+      'read-attachment',
+      { description: 'Read the invoice PDF' },
+      async () => {
+        const bytes = await readAttachment(input, 0);
+        // process bytes…
+        return { size: bytes.length };
+      }
+    );
+  }
+);
+```
+
+### Reading attachments
+
+`readAttachment(message, index)` returns the raw bytes of an attachment. It must be called **inside a step function**. The index corresponds to the position in `message.attachments`.
+
+- Messages with attachments are kept for **30 days** from arrival.
+- After 30 days, `readAttachment` fails with `workflow.attachment_not_found`.
+- A message with no non-inline attachments has `stored: null`; `readAttachment` fails immediately for those.
+
+### Rate limit
+
+Email triggers start at most **60 runs per hour per workflow**. Mail beyond the rate limit is refused temporarily; the sender receives a transient error and may retry. The same message delivered again (identified by Message-ID) starts no second run.
+
+<Warning>
+  **Email senders are completely untrusted.** The `from` field is whatever the sender wrote in their message headers — nothing in the platform vouches for it. Never use `input.from.address` to grant permissions or make authorisation decisions. Treat `input.subject`, `input.text`, and attachment content as untrusted data from an anonymous sender.
+</Warning>

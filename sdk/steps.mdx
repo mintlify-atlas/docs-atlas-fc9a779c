@@ -1,0 +1,349 @@
+---
+title: "StepRunner — All Four Step Methods in Full Detail"
+sidebarTitle: "Steps"
+description: "do, llm, decision, and sleep: StepRunner's four durable methods, always one at a time. Full options, retry semantics, Duration type, and idempotency keys."
+---
+
+Every action a workflow performs goes through `StepRunner`, the first argument of the workflow function. Steps are the unit of durability: when a run resumes after a crash or a Worker restart, completed steps return their recorded results instantly without re-running their code. The engine records each step's output as JSON before moving on, so your workflow function is deterministic on replay. The `step` reference is exclusively for making step calls — never pass it to another function, store it in a variable, or call it from inside a step's own callback.
+
+<Note>
+  Steps run **one after another, never concurrently and never nested**. Starting a step from inside another step's function throws `workflow.invalid_step_call`. If you need to process a list, use a `for...of` loop in the workflow function body with a `key` on the step inside it.
+</Note>
+
+---
+
+## Step naming rules
+
+Every step name must match the pattern: **a letter followed by up to 63 letters, digits, hyphens (`-`), or underscores (`_`)** — between 1 and 64 characters total. Names are case-sensitive. A name must be a string literal in the call so `describeWorkflow` can read the step list from the source. Each name may appear **once per run** unless the step also has a `key`.
+
+```ts
+// ✅ Valid names
+await step.do('fetch-invoice', { ... }, fn);
+await step.do('send_notification', { ... }, fn);
+
+// ❌ Invalid — starts with a digit
+await step.do('1st-step', { ... }, fn);
+
+// ❌ Invalid — duplicate name without a key
+await step.do('fetch', { ... }, fn);
+await step.do('fetch', { ... }, fn); // throws workflow.invalid_step_call
+```
+
+---
+
+## step.do
+
+Runs plain TypeScript code durably. The function's return value is serialised as JSON and recorded; on replay the recorded value is returned without calling the function again.
+
+```ts
+step.do(name, options, fn)
+```
+
+### Options
+
+<ParamField path="description" type="string" required>
+  What the step does, in plain language. The UI shows it next to the step in the run view. Must be a string literal (not a variable) so the step list can be read from source.
+</ParamField>
+
+<ParamField path="key" type="string | number" optional>
+  Distinguishes multiple runs of the same step name within one run, e.g. the ID of the item in a loop. Without a key, the step runs exactly once per run.
+</ParamField>
+
+<ParamField path="sideEffect" type="boolean" optional>
+  When `true`, marks the step as one that changes something outside Grasp. The function receives `{ idempotencyKey, input }` — pass `idempotencyKey` to every connector call inside so the platform can deduplicate retries. A side-effect step without `input` is a validation error.
+</ParamField>
+
+<ParamField path="locked" type="boolean" optional>
+  When `true`, marks the step as deterministic with no model involvement — suitable for computing totals, account numbers, and reference strings. A `locked` step cannot also be `sideEffect`.
+</ParamField>
+
+<ParamField path="input" type="Json" optional>
+  The data the step works on. For side-effect steps this is **required** (pass `null` if the step writes nothing of its own). The input is recorded alongside the step and shown in dry runs so the UI can display what a side-effect step would write without running it.
+</ParamField>
+
+<ParamField path="retries" type="Retries" optional>
+  How often to retry on recoverable failures. See [Retries](#retries) below.
+</ParamField>
+
+<ParamField path="timeout" type="Duration" optional>
+  How long one attempt may take before the engine cancels it. Defaults to the engine's own default (Cloudflare Workflows: 10 minutes).
+</ParamField>
+
+### Regular step
+
+```ts
+const invoice = await step.do(
+  'fetch-invoice',
+  { description: 'Load the invoice from the ERP', input: { id: input.invoiceId } },
+  async ({ input: stepInput }) => {
+    const data = await env.ERP.call('getInvoice', stepInput.id);
+    return { amount: data.amount, vendor: data.vendor };
+  }
+);
+```
+
+### Side-effect step
+
+The `idempotencyKey` is `runId:stepName` (or `runId:stepName:key` for keyed steps). Pass it directly to connector calls — never construct your own.
+
+```ts
+await step.do(
+  'send-confirmation',
+  {
+    description: 'Email the vendor a confirmation',
+    sideEffect: true,
+    input: { to: invoice.vendor, invoiceId: input.invoiceId },
+  },
+  async ({ idempotencyKey, input: stepInput }) => {
+    await env.MAIL.call('send', {
+      to: stepInput.to,
+      subject: `Confirmed: ${stepInput.invoiceId}`,
+      idempotencyKey,
+    });
+  }
+);
+```
+
+### Keyed step in a loop
+
+```ts
+for (const item of input.lineItems) {
+  await step.do(
+    'book-line',
+    {
+      description: 'Book one line item',
+      sideEffect: true,
+      input: { lineId: item.id, amount: item.amount },
+      key: item.id,
+    },
+    async ({ idempotencyKey, input: stepInput }) => {
+      await env.LEDGER.call('bookLine', { ...stepInput, idempotencyKey });
+    }
+  );
+}
+```
+
+---
+
+## step.llm
+
+Calls the model gateway and validates the answer against a Zod schema. An answer that doesn't match the schema is treated as a retryable failure and the model is asked again up to the step's retry limit.
+
+```ts
+step.llm(name, options)
+```
+
+<Warning>
+  Deployment rules may refuse an `llm` call before the model is reached. A refusal from a rule (EU data residency constraint, model budget exhausted, restricted data classification) fails the step immediately and is **not** retried — the failure message explains why.
+</Warning>
+
+### Options
+
+<ParamField path="description" type="string" required>
+  What the step does, for the UI and run history.
+</ParamField>
+
+<ParamField path="model" type="Model" required>
+  A `model` parameter value (from `params.yourModel`). Must be a `model` param — not a string literal — so the UI exposes model governance.
+</ParamField>
+
+<ParamField path="instructions" type="string" required>
+  The prompt. Must be a string literal so the step list captures it.
+</ParamField>
+
+<ParamField path="input" type="Json" required>
+  The data the model works on, e.g. the text of an invoice.
+</ParamField>
+
+<ParamField path="schema" type="ZodType" required>
+  The Zod schema the answer must conform to. The raw JSON answer is recorded (not the parsed value), and parsed again on replay.
+</ParamField>
+
+<ParamField path="retries" type="Retries" optional>
+  Retry configuration. A schema mismatch (`workflow.invalid_model_output`) is retryable.
+</ParamField>
+
+<ParamField path="timeout" type="Duration" optional>
+  Per-attempt time limit.
+</ParamField>
+
+### Example
+
+```ts
+const extracted = await step.llm('extract', {
+  description: 'Extract structured fields from invoice text',
+  model: params.model,
+  instructions: 'Extract the total amount, currency, and vendor name from the invoice text.',
+  input: { text: invoice.rawText },
+  schema: z.object({
+    amount: z.number(),
+    currency: z.string().length(3),
+    vendor: z.string(),
+  }),
+  retries: { limit: 3 },
+});
+// extracted.amount / extracted.currency / extracted.vendor are fully typed
+```
+
+---
+
+## step.decision
+
+Asks a person to decide and durably waits for their answer, up to a timeout. The decision opens immediately and stays open until answered or the timeout passes. A reminder is sent once if `remindAfter` is set.
+
+```ts
+step.decision(name, options)
+```
+
+### Options
+
+<ParamField path="description" type="string" required>
+  What they are being asked. Shown in the UI decision inbox.
+</ParamField>
+
+<ParamField path="from" type="Person" required>
+  Who may answer: a `person` parameter value — `person:<userId>`, `role:<roleName>`, or `team:<teamId>`. Only the named person or group can answer, signed in as they currently are. The run's **starter is never eligible** unless `from` names them exactly. Every answer is audited under the answerer's identity.
+</ParamField>
+
+<ParamField path="ask" type="async (request: DecisionRequest) => void" required>
+  Called to notify people that a decision is waiting. Receives a `DecisionRequest` with `recipients` (each with a `link` they follow to answer), `reminder` (false on first ask, true on reminder), and `idempotencyKey` (pass to connector calls).
+</ParamField>
+
+<ParamField path="timeout" type="Duration" required>
+  How long the decision stays open. The deadline is set when the decision opens — time spent in `ask` doesn't extend it.
+</ParamField>
+
+<ParamField path="remindAfter" type="Duration" optional>
+  If set, `ask` is called once more this long after the original ask, before the timeout. Must be less than `timeout`.
+</ParamField>
+
+### Return value — `Decision`
+
+```ts
+type Decision =
+  | { timedOut: false; approved: boolean; by: string; payload: Json | null }
+  | { timedOut: true };
+```
+
+<Warning>
+  A timeout is **never approval**. Always handle `timedOut: true` as a negative outcome: nobody decided, so treat it as a rejection or ask again.
+</Warning>
+
+### Example
+
+```ts
+const decision = await step.decision('review', {
+  description: `Approve payment of €${(input.amount / 100).toFixed(2)} to ${input.vendor}`,
+  from: params.approver,
+  ask: async ({ recipients, idempotencyKey, reminder }) => {
+    await env.MAIL.call('send', {
+      to: recipients,
+      subject: reminder
+        ? `Reminder: approval needed for ${input.invoiceId}`
+        : `Approval needed: ${input.invoiceId}`,
+      idempotencyKey,
+    });
+  },
+  timeout: '3 days',
+  remindAfter: '1 day',
+});
+
+if (decision.timedOut) {
+  return { outcome: 'timed-out' };
+}
+if (!decision.approved) {
+  return { outcome: 'rejected', by: decision.by, note: decision.payload };
+}
+```
+
+---
+
+## step.sleep
+
+Durably pauses the run for a fixed duration. The sleep is recorded the moment it starts; on replay the recorded sleep is skipped instantly. Sleeps count toward the run's total step budget.
+
+```ts
+step.sleep(name, options)
+```
+
+### Options
+
+<ParamField path="description" type="string" required>
+  Why the run is pausing, e.g. "Wait before sending a reminder".
+</ParamField>
+
+<ParamField path="duration" type="Duration" required>
+  How long to pause. See [Duration](#duration) below.
+</ParamField>
+
+### Example
+
+```ts
+await step.sleep('cooling-off', {
+  description: 'Wait 24 hours before sending the follow-up',
+  duration: '1 day',
+});
+```
+
+---
+
+## Retries
+
+The `Retries` object configures how many times a step is tried again after a recoverable failure.
+
+<Note>
+  `limit` counts **retries**, not attempts. `limit: 2` means three attempts total. Only failures that retrying can fix are retried: a connection timeout, a rate limit, `workflow.invalid_model_output`, or a platform error. A refusal, a tool's own error, or an error the workflow throws stops the step immediately regardless of retries.
+</Note>
+
+```ts
+interface Retries {
+  limit: number;      // 0–10,000 retries
+  delay?: Duration;   // wait before the first retry
+  backoff?: 'constant' | 'linear' | 'exponential';
+}
+```
+
+When `retries` is omitted entirely, the engine's defaults apply (Cloudflare Workflows: 5 retries, 10 seconds apart, exponential backoff).
+
+```ts
+await step.do(
+  'call-api',
+  {
+    description: 'POST to the external API',
+    sideEffect: true,
+    input: { payload: data },
+    retries: { limit: 5, delay: '30 seconds', backoff: 'exponential' },
+  },
+  async ({ idempotencyKey, input: stepInput }) => {
+    await env.API.call('post', { ...stepInput, idempotencyKey });
+  }
+);
+```
+
+---
+
+## Duration
+
+`Duration` is either a whole number of milliseconds or a human-readable string:
+
+```ts
+type Duration =
+  | number
+  | `${number} ${'second' | 'minute' | 'hour' | 'day' | 'week'}${'s' | ''}`;
+```
+
+<CodeGroup>
+```ts Milliseconds
+timeout: 30_000        // 30 seconds
+duration: 86_400_000   // 1 day
+```
+
+```ts Strings
+timeout: '30 seconds'
+duration: '1 day'
+delay: '2 hours'
+timeout: '3 weeks'
+```
+</CodeGroup>
+
+The maximum duration is **365 days**. Fractional amounts are allowed in string form (e.g. `'1.5 hours'`) as long as the result is a whole number of milliseconds.

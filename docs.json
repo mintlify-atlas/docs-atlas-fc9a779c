@@ -1,72 +1,103 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Grasp OS",
+  "theme": "luma",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#6366F1",
+    "light": "#EEF2FF",
+    "dark": "#312E81"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/grasplabs/os"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/grasplabs/os"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Overview",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "architecture",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/apps",
+              "concepts/workflows",
+              "concepts/knowledge",
+              "concepts/connectors",
+              "concepts/permissions",
+              "concepts/audit-log"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Building Apps",
+        "groups": [
+          {
+            "group": "Apps",
+            "pages": [
+              "apps/overview",
+              "apps/server",
+              "apps/screens",
+              "apps/exports"
+            ]
+          },
+          {
+            "group": "Workflow SDK",
+            "pages": [
+              "sdk/workflow",
+              "sdk/steps",
+              "sdk/params",
+              "sdk/triggers",
+              "sdk/screen",
+              "sdk/testing"
+            ]
+          },
+          {
+            "group": "Connectors",
+            "pages": [
+              "connectors/overview",
+              "connectors/building",
+              "connectors/native"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Platform",
+        "groups": [
+          {
+            "group": "Deployment",
+            "pages": [
+              "platform/deployment",
+              "platform/configuration",
+              "platform/development"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "platform/releases",
+              "platform/audit-log",
+              "platform/security"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

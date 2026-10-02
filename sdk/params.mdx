@@ -1,0 +1,275 @@
+---
+title: "Workflow Parameters — Tunable Values Without Code Changes"
+sidebarTitle: "Parameters"
+description: "money, number, text, person, schedule, model, and template params let operators tune runs in the UI. Sensitive values are never written to the audit log."
+---
+
+Workflow parameters are tunable values that operators and builders can change in the Grasp OS UI without editing any code. Each parameter is declared once in the `params` block of `workflow()`, shows up in the workflow's settings page, and arrives in the workflow function as a typed, validated value through `params.yourName`. Because the runtime records parameter values in the first step of every run (`$params`), a replay always uses the values the run started with — changing a parameter mid-run has no effect on running instances.
+
+Parameters are the only mechanism for governance-sensitive values (models, approvers, schedules, thresholds). Hard-coding them makes a workflow impossible to tune without a code review and deployment.
+
+---
+
+## Declaring parameters
+
+All seven param kinds are imported alongside `workflow`:
+
+```ts
+import {
+  workflow,
+  money, number, text, person, schedule, model, template,
+} from '@grasp-os/sdk/workflow';
+```
+
+Declare them in the `params` object in your `workflow()` call:
+
+```ts
+export default workflow(
+  'invoice-approval',
+  {
+    params: {
+      threshold:  money({ label: 'Review invoices above', currency: 'EUR', default: 500_000 }),
+      reviewer:   person({ label: 'Reviewer', default: 'role:finance' }),
+      aiModel:    model({ label: 'AI model', default: 'gpt-4o' }),
+      runAt:      schedule({ label: 'Runs', default: '0 8 * * 1' }),
+    },
+  },
+  async (step, { params }) => {
+    // params.threshold  → number (minor units)
+    // params.reviewer   → Person
+    // params.aiModel    → Model
+    // params.runAt      → Schedule
+  }
+);
+```
+
+---
+
+## money
+
+An amount of money in **whole minor units** of the declared currency (cents for EUR, pence for GBP). Using integers avoids floating-point rounding when amounts are added or compared.
+
+```ts
+money(options: {
+  label: string;
+  currency: string;  // ISO 4217, e.g. 'EUR'
+  default: number;   // in minor units — 500_000 is €5,000.00
+  sensitive?: boolean;
+}): Param<'money'>
+```
+
+The runtime value is a `number` (integer). `currency` must be a valid ISO 4217 code; the runtime validates it on load.
+
+```ts
+threshold: money({
+  label: 'Review invoices above',
+  currency: 'EUR',
+  default: 500_000,  // €5,000.00
+}),
+```
+
+---
+
+## number
+
+A plain number — integers and decimals both accepted.
+
+```ts
+number(options: {
+  label: string;
+  default: number;
+  sensitive?: boolean;
+}): Param<'number'>
+```
+
+```ts
+maxRetries: number({ label: 'Max send retries', default: 3 }),
+```
+
+---
+
+## text
+
+A piece of text — any string.
+
+```ts
+text(options: {
+  label: string;
+  default: string;
+  sensitive?: boolean;
+}): Param<'text'>
+```
+
+```ts
+replyAddress: text({ label: 'Reply-to address', default: 'noreply@example.com' }),
+```
+
+---
+
+## person
+
+A person or group that a `step.decision` step waits for answers from. The runtime value is a branded `Person` string in one of three forms:
+
+| Form | Example | Meaning |
+|------|---------|---------|
+| `person:<userId>` | `person:usr_01abc` | One specific user |
+| `role:<roleName>` | `role:finance` | Everyone with this role |
+| `team:<teamId>` | `team:team_01xyz` | Everyone in this team |
+
+```ts
+person(options: {
+  label: string;
+  default: string;  // one of the three forms above
+}): Param<'person'>
+```
+
+```ts
+approver: person({ label: 'Invoice approver', default: 'role:finance' }),
+```
+
+<Note>
+  `person` params don't have a `sensitive` option — the value is a user ID or role name, never a secret.
+</Note>
+
+---
+
+## schedule
+
+A cron schedule expressed as **five space-separated cron fields** (minute, hour, day-of-month, month, day-of-week). Used with a `{ type: 'schedule' }` trigger to control when the workflow runs.
+
+```ts
+schedule(options: {
+  label: string;
+  default: string;  // five cron fields, e.g. '0 8 * * 1'
+}): Param<'schedule'>
+```
+
+```ts
+runAt: schedule({ label: 'Runs every', default: '0 8 * * 1' }), // Mondays at 08:00
+```
+
+The default must be a valid cron expression that names a time still to come. The `{ type: 'schedule' }` trigger interprets it in the `timeZone` you specify there.
+
+---
+
+## model
+
+A model from the model gateway. Always govern model selection through a param — it exposes the choice to operators and lets deployment rules (EU constraint, budget limits) apply.
+
+```ts
+model(options: {
+  label: string;
+  default: string;  // a model name, e.g. 'gpt-4o'
+}): Param<'model'>
+```
+
+```ts
+aiModel: model({ label: 'AI model', default: 'gpt-4o' }),
+```
+
+Pass the value directly to `step.llm`'s `model` option:
+
+```ts
+const result = await step.llm('classify', {
+  description: 'Classify the document',
+  model: params.aiModel,
+  instructions: 'Classify this document as invoice, receipt, or other.',
+  input: { text: doc.text },
+  schema: z.object({ type: z.enum(['invoice', 'receipt', 'other']) }),
+});
+```
+
+---
+
+## template
+
+A template name — for example the name of an email template to render. The platform doesn't interpret it; your connector or server code does.
+
+```ts
+template(options: {
+  label: string;
+  default: string;
+}): Param<'template'>
+```
+
+```ts
+emailTemplate: template({ label: 'Approval request template', default: 'invoice-approval-v2' }),
+```
+
+---
+
+## sensitive
+
+Any param except `person` accepts `sensitive: true`. A sensitive parameter's value is **never written to the audit log**, regardless of what it contains. People set it the same way as any other param.
+
+```ts
+apiSecret: text({
+  label: 'Webhook signing secret',
+  default: '',
+  sensitive: true,
+}),
+```
+
+<Warning>
+  **`sensitive: true` is not encryption** — the value is stored and handled by the platform the same way as any other param. It only controls audit-log visibility. Never use a workflow param to carry production secrets that must be rotated; use a binding secret instead.
+</Warning>
+
+---
+
+## Reading params in your workflow
+
+Use `params.name` directly in step options, the step's callback function, or in `if` conditions and loop heads. This is the only place the `describeWorkflow` tool can read parameter usage from, and the only place the step outline shows which params each step uses.
+
+```ts
+async (step, { params, input }) => {
+  // ✅ In a step option
+  const result = await step.llm('classify', {
+    description: 'Classify the document',
+    model: params.aiModel,
+    instructions: '...',
+    input: { text: input.text },
+    schema: z.object({ type: z.string() }),
+  });
+
+  // ✅ In an if condition
+  if (input.amount > params.threshold) {
+    await step.decision('review', {
+      description: `Approve €${(input.amount / 100).toFixed(2)}`,
+      from: params.reviewer,
+      ask: async ({ recipients, idempotencyKey }) => { ... },
+      timeout: '3 days',
+    });
+  }
+
+  // ✅ In a step callback
+  await step.do(
+    'post',
+    { description: 'Post to the webhook', sideEffect: true, input: { amount: input.amount } },
+    async ({ idempotencyKey }) => {
+      await env.WEBHOOK.call('post', { limit: params.threshold, idempotencyKey });
+    }
+  );
+}
+```
+
+<Warning>
+  **Never read a param into an intermediate variable.** The `describeWorkflow` constraint requires that every `params.name` read appears directly in a step's options or callback, an `if` condition, or a loop head. Reading into a variable (`const t = params.threshold`) is a `workflow.invalid_definition` error at build time — the step list can't follow a value once it leaves `params`.
+</Warning>
+
+---
+
+## ParamValues type
+
+`ParamValues<P>` is a mapped type that turns your params record into the types your workflow function receives. TypeScript infers it automatically from `config.params` — you don't need to write it yourself. Each param kind maps to its runtime type:
+
+| Kind | Runtime type |
+|------|-------------|
+| `money` | `number` (integer, minor units) |
+| `number` | `number` |
+| `text` | `string` |
+| `person` | `Person` (branded `string`) |
+| `schedule` | `Schedule` (branded `string`) |
+| `model` | `Model` (branded `string`) |
+| `template` | `Template` (branded `string`) |
+
+The branded types (`Person`, `Model`, `Schedule`, `Template`) ensure you can't accidentally pass a model name where a person is expected or vice versa — TypeScript catches the mistake at compile time.

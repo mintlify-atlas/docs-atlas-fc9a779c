@@ -1,47 +1,198 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Run Grasp OS Locally and Write Your First Workflow"
+sidebarTitle: "Quickstart"
+description: "Install dependencies, configure local secrets, start the dev server, and write a minimal workflow with @grasp-os/sdk — from a fresh clone to running code."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+This guide takes you from a fresh clone of the repository to a running local development environment, then walks you through writing your first workflow. The dev server runs the frontend on `localhost:5173` and both Core and Connect behind it on `localhost:8787`. Sign-in is handled by a local fake IdP so you never need real IdP credentials for day-to-day development.
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+  <Step title="Prerequisites">
+    Grasp OS requires **Node.js 24** (the version in `.node-version` at the repo root) and **pnpm**, which ships with Vite+ (`vp`) — the repo's toolchain. Before you clone, make sure you have a Node version manager (such as [fnm](https://github.com/Schniz/fnm) or [nvm](https://github.com/nvm-sh/nvm)) that can read `.node-version` automatically.
 
     ```bash
-    npm install your-package
+    # Confirm Node.js picks up .node-version on cd
+    node --version   # should print v24.x.x
+
+    # Vite+ installs pnpm for you — you don't need a global pnpm install
     ```
+
+    You also need **Wrangler** authentication for any staging or production deploy. Wrangler credentials are managed through the **1Password shell plugin** — never through plain environment variables or `wrangler login`.
+
+    <Note>
+      The 1Password shell plugin injects Cloudflare credentials automatically when Wrangler needs them. See your team's 1Password vault for the `Wrangler (grasp-os-staging)` item and follow the plugin setup steps there. You do **not** need this for local dev; the fake IdP and local Wrangler preview skip the credential check.
+    </Note>
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Install dependencies">
+    Vite+ manages the install. Run this once after cloning, and again whenever the lockfile changes (e.g. after pulling from `main`):
 
     ```bash
-    your-cli init
+    vp install
     ```
+
+    This installs all workspace dependencies and sets up the Git hooks (`commit-msg` for Conventional Commits and `pre-push` for branch name checks). Only packages in the `allowBuilds` list in `pnpm-workspace.yaml` may run install scripts; everything else is installed without lifecycle hooks.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Set up local secrets">
+    Local secrets live in `.dev.vars` files in each Worker's app directory. They are **never committed** — `secretlint` checks every commit and CI enforces it. Copy the example files and fill in values:
+
+    **`apps/core/.dev.vars`** (copy from `.dev.vars.example`):
+
+    ```ini
+    # Signs session cookies and encrypts sign-in state.
+    # Any random value of at least 32 characters.
+    # Example: openssl rand -base64 32
+    BETTER_AUTH_SECRET=
+
+    # Signs the capability each call to Connect carries.
+    # Must match the value in apps/connect/.dev.vars.
+    # Example: openssl rand -base64 32
+    CAPABILITY_SIGNING_KEY=
+
+    # Shared with the router. vp run dev skips the router-secret check
+    # for localhost requests, so this may stay empty locally.
+    ROUTER_SECRET=
+    ```
+
+    **`apps/connect/.dev.vars`** (copy from `.dev.vars.example`):
+
+    ```ini
+    # Verifies the capability Core signs for each call.
+    # Must match the value in apps/core/.dev.vars.
+    CAPABILITY_SIGNING_KEY=
+    ```
+
+    Generate the two secrets you need:
 
     ```bash
-    your-cli start
+    # Run twice — once for BETTER_AUTH_SECRET, once for CAPABILITY_SIGNING_KEY
+    openssl rand -base64 32
     ```
+
+    Paste the **same** value for `CAPABILITY_SIGNING_KEY` in both files. `ROUTER_SECRET` can stay empty for local dev.
+
+    <Warning>
+      Never commit `.dev.vars` files or paste real secret values into any file that is tracked by Git. The `secretlint` hook will block the commit, but a bypass will expose credentials. If you accidentally commit a secret, rotate it immediately.
+    </Warning>
   </Step>
+
+  <Step title="Start the development server">
+    One command starts everything:
+
+    ```bash
+    vp run dev
+    ```
+
+    This brings up:
+
+    - **Frontend** at `http://localhost:5173` — the React SPA (hot-module reload via Vite)
+    - **Core + Connect** at `http://localhost:8787` — the two Workers running under Wrangler's local mode, with the frontend proxied from Core
+
+    Sign in with any email address at `acme.test` (e.g. `alice@acme.test`). Use `admin@acme.test` to sign in as an admin. The local fake IdP (`scripts/dev.ts`) handles sign-in so no real Entra or Google credentials are needed.
+
+    To run the staff console separately:
+
+    ```bash
+    vp -C apps/console dev
+    ```
+
+    <Tip>
+      After changing a `wrangler.jsonc` file, run `vp run -r typegen` to regenerate `worker-configuration.d.ts`. CI fails when generated files are out of date.
+    </Tip>
+  </Step>
+
+  <Step title="Write your first workflow">
+    Workflows live inside an App's directory. A workflow file exports a single default `workflow(...)` call. Workflow code may only import from `@grasp-os/sdk` — never from Core, Connect, or any engine internals.
+
+    Here is a minimal workflow that takes a text input and uses an LLM to produce a short summary:
+
+    ```typescript
+    // app/workflows/summarise.ts
+    import { workflow, model, text, z } from "@grasp-os/sdk/workflow";
+
+    export default workflow(
+      "summarise",
+      {
+        params: {
+          summaryModel: model({
+            label: "Model to summarise with",
+            default: "workers-ai/@cf/meta/llama-3.1-8b-instruct",
+          }),
+          maxWords: text({
+            label: "Maximum words in summary",
+            default: "80",
+          }),
+        },
+      },
+      async (step, { params, input }) => {
+        const summary = await step.llm("summarise", {
+          description: "Summarise the document",
+          model: params.summaryModel,
+          instructions: `Summarise the following text in at most ${params.maxWords} words.`,
+          input: { text: input },
+          schema: z.object({ summary: z.string() }),
+        });
+
+        return summary.summary;
+      }
+    );
+    ```
+
+    **What this does, line by line:**
+
+    - `workflow(id, config, run)` — the entry point from `@grasp-os/sdk/workflow`. The `id` must be a slug matching `[a-z][a-z0-9-]*`.
+    - `params` — tunable values shown in the Grasp UI. `model(...)` produces a `Model` param that wires to the deployment's allowed models; `text(...)` produces a plain string param.
+    - `step.llm(name, options)` — asks the model gateway for a structured answer. The `schema` field is a Zod schema; the gateway validates the model's response against it and retries if it doesn't match.
+    - The workflow returns plain JSON — the run's recorded result.
+
+    A workflow with a schedule trigger looks like this:
+
+    ```typescript
+    import { workflow, schedule, z } from "@grasp-os/sdk/workflow";
+
+    export default workflow(
+      "weekly-report",
+      {
+        params: {
+          every: schedule({ label: "Runs", default: "0 8 * * 1" }),
+        },
+        triggers: [
+          { type: "schedule", param: "every", timeZone: "Europe/Amsterdam" },
+        ],
+      },
+      async (step) => {
+        await step.do("generate", { description: "Generate report" }, async () => {
+          // side-effect-free computation — result is recorded and replayed
+          return { generated: true };
+        });
+      }
+    );
+    ```
+
+    <Note>
+      The workflow ID, step names, and options must be **literals** in the source. The `describeWorkflow` function in `@grasp-os/sdk/describe` reads the step list statically from the code, and the UI displays it. Dynamic names or computed options will break static analysis.
+    </Note>
+
+    Once your workflow file is in place, make the App version current through the Console. The trigger (if any) takes effect when the version becomes current, and stops when a version without it does.
+  </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Next steps
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+<CardGroup cols={2}>
+  <Card title="System architecture" icon="diagram-project" href="/architecture">
+    Understand how the five Workers interact and how EU jurisdiction is enforced across every resource.
+  </Card>
+  <Card title="Apps" icon="grid-2" href="/concepts/apps">
+    Learn how to structure an App: server class, screens, exported methods, and permissions.
+  </Card>
+  <Card title="Workflow SDK" icon="code" href="/sdk/workflow">
+    Full reference for `@grasp-os/sdk/workflow`: steps, params, triggers, decisions, and side effects.
+  </Card>
+  <Card title="Connectors" icon="plug" href="/concepts/connectors">
+    Connect workflows to Microsoft 365, Google Workspace, and other systems through the connector layer.
+  </Card>
+</CardGroup>

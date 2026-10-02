@@ -1,0 +1,211 @@
+---
+title: "Grasp OS Configuration Variables and Secrets Reference"
+sidebarTitle: "Configuration"
+description: "Complete reference for every config var and secret in the core and connect Workers, including who sets each one and what happens if it is absent."
+---
+
+Grasp OS configuration is split cleanly between two kinds of values: **config vars** that the staff console sets through the Cloudflare API after each deploy, and **secrets** that are provisioned once and rotated deliberately. Neither kind belongs in `wrangler.jsonc`. Config vars are preserved across deploys by `keep_vars: true`; secrets are stored in Cloudflare's encrypted secrets store and loaded into the Worker at runtime. Locally, you copy `.dev.vars.example` to `.dev.vars` and fill in the secrets — that file must never be committed.
+
+<Warning>
+  Never commit secrets, client names, or client configuration to the repository. `secretlint` checks every commit and CI rejects any that contain them. For local development, put secrets in `.dev.vars` (see `.dev.vars.example` in each app). Wrangler loads **only** the secrets listed in `secrets.required` from `.dev.vars`; deployment config vars (`SIGN_IN`, `MODEL_GATEWAY`, etc.) must be passed with `--var NAME:<value>` at dev time.
+</Warning>
+
+---
+
+## Core Worker (`grasp-os-core`)
+
+### Config vars
+
+These vars are set by the console through the Cloudflare API. Because `keep_vars: true` is set in `apps/core/wrangler.jsonc`, a Wrangler deploy preserves them rather than deleting them. They are intentionally not listed in `wrangler.jsonc`; listing them there would cause every deploy to overwrite the console's values.
+
+<ParamField body="SIGN_IN" type="JSON object" required>
+  Identity provider settings for this deployment. Controls which Entra or Google OAuth application is used for sign-in, and which email domains are permitted. Without this var, no user can authenticate.
+
+  Contains the OAuth client IDs for any enabled IdPs and the list of allowed domains. The matching client secret (below) must also be set.
+
+  **Source:** `src/auth/config.ts`
+</ParamField>
+
+<ParamField body="MODEL_GATEWAY" type="JSON object">
+  AI Gateway configuration for this deployment. Specifies the AI Gateway URL, the set of models the deployment is permitted to use, and any client-specific model rules (see `src/model-rules.ts`).
+
+  If unset, core falls back to the Cloudflare account's default AI Gateway and Workers AI models. Provider API keys are held by AI Gateway — the core Worker never sees a raw provider key.
+
+  **Source:** `src/models.ts`
+</ParamField>
+
+<ParamField body="PLATFORM_CHANGE" type="JSON object">
+  Records who made the current release and what changed. The cron job reads this var once per deployed version and writes a platform-update entry to the audit log. Used to give clients a human-readable record of every Grasp OS update.
+
+  **Source:** `src/platform-updates.ts`
+</ParamField>
+
+<ParamField body="AUDIT_RETENTION_DAYS" type="number" default="180">
+  How long a workflow run's detail records are kept before they are moved to the audit archive. Minimum value is 30 days. If unset, defaults to 180 days.
+
+  This controls active retention only — archived events follow `AUDIT_ARCHIVE_RETENTION_DAYS`.
+
+  **Source:** `src/audit-log.ts`
+</ParamField>
+
+<ParamField body="AUDIT_ARCHIVE_RETENTION_DAYS" type="number">
+  The maximum age of an archived audit event before it is permanently purged from the `grasp-os-audit-archive` R2 bucket, counted from when the audit log received it. Must be at least 365 days and at least `AUDIT_RETENTION_DAYS`.
+
+  **If unset, archived events are never purged.** Set this only when a client has a defined data-retention policy that requires deletion.
+
+  **Source:** `src/audit-log.ts`
+</ParamField>
+
+<ParamField body="RUN_RETENTION_DAYS" type="number" default="30">
+  How long the workflow engine keeps a completed run's detail record, from 1 to 30 days. After this period the engine drops the record; the audit log entry is unaffected. Defaults to 30 days if unset.
+
+  **Source:** `src/workflows/retention.ts`
+</ParamField>
+
+---
+
+### Secrets
+
+Core's `wrangler.jsonc` declares these three as `secrets.required`. A deploy fails if any of them is missing. Set them with `wrangler secret put <NAME>` or through the console.
+
+<ParamField body="ROUTER_SECRET" type="string" required>
+  The secret the router Worker sends as a header on every request it proxies to core. Core verifies the header on every incoming request, including requests for static frontend assets, because `run_worker_first: true` means the Worker executes before assets are served.
+
+  Derived by the router from a per-client key (`@grasp-os/shared/router`). During a rotation, set `ROUTER_SECRET_PREVIOUS` to the old value so core accepts both during the transition window.
+
+  **Source:** `src/router-secret.ts`
+</ParamField>
+
+<ParamField body="ROUTER_SECRET_PREVIOUS" type="string">
+  Optional. During a `ROUTER_SECRET` rotation, set this to the previous value. Core accepts requests signed with either the current or the previous secret while both are set. Remove it once all routers have been updated to the new key.
+
+  **Source:** `src/router-secret.ts`
+</ParamField>
+
+<ParamField body="BETTER_AUTH_SECRET" type="string" required>
+  Signs session cookies and encrypts sign-in state (OAuth `state` parameters and PKCE verifiers). Must be at least 32 characters. Generate with:
+
+  ```bash
+  openssl rand -base64 32
+  ```
+
+  If this secret changes, all active sessions are immediately invalidated and users must sign in again.
+</ParamField>
+
+<ParamField body="CAPABILITY_SIGNING_KEY" type="string" required>
+  Shared between core and connect. Core signs a short-lived capability and includes it in every service-binding call to connect. Connect verifies the signature before executing any action. The same value must be set on both Workers.
+
+  Must be at least 32 characters. Generate with:
+
+  ```bash
+  openssl rand -base64 32
+  ```
+</ParamField>
+
+---
+
+### IdP secrets
+
+These are set by the console alongside `SIGN_IN`. While an IdP secret is unset, sign-in via that provider is refused.
+
+<ParamField body="ENTRA_CLIENT_SECRET" type="string">
+  The OAuth client secret for the Microsoft Entra application configured in `SIGN_IN`. Required when Entra is enabled as an identity provider.
+</ParamField>
+
+<ParamField body="GOOGLE_CLIENT_SECRET" type="string">
+  The OAuth client secret for the Google application configured in `SIGN_IN`. Required when Google is enabled as an identity provider.
+</ParamField>
+
+---
+
+## Connect Worker (`grasp-os-connect`)
+
+Connect is reached only through core's service binding — its `workers_dev` is `false` and it has no public URL. It holds the only OAuth tokens in the system.
+
+### Required secret
+
+<ParamField body="CAPABILITY_SIGNING_KEY" type="string" required>
+  Connect's only required secret. Must match the value set on core. Connect verifies the signed capability on every call it receives before executing anything.
+
+  **Source:** `src/env.d.ts`
+</ParamField>
+
+---
+
+### Console-managed secrets
+
+These secrets are set by the console through the Cloudflare API. Connect handles their absence gracefully: it refuses to connect or use the relevant provider rather than crashing, so they are not in `secrets.required`.
+
+<ParamField body="TOKEN_ENCRYPTION_KEY" type="string">
+  Seals and unseals OAuth access and refresh tokens stored in connect's D1 vault. Without this key, connect refuses all OAuth connections. On key rotation, connect's cron job re-encrypts existing tokens with the new key.
+
+  **Source:** `src/vault.ts`
+</ParamField>
+
+<ParamField body="MICROSOFT_CLIENT_ID" type="string">
+  The OAuth application client ID for Microsoft (Entra). Required alongside `MICROSOFT_CLIENT_SECRET` to enable Microsoft account connections. Without either, connecting a Microsoft account is refused.
+
+  **Source:** `src/providers.ts`
+</ParamField>
+
+<ParamField body="MICROSOFT_CLIENT_SECRET" type="string">
+  The OAuth application client secret for Microsoft. Required alongside `MICROSOFT_CLIENT_ID`.
+</ParamField>
+
+<ParamField body="GOOGLE_CLIENT_ID" type="string">
+  The OAuth application client ID for Google. Required alongside `GOOGLE_CLIENT_SECRET` to enable Google account connections.
+
+  **Source:** `src/providers.ts`
+</ParamField>
+
+<ParamField body="GOOGLE_CLIENT_SECRET" type="string">
+  The OAuth application client secret for Google. Required alongside `GOOGLE_CLIENT_ID`.
+</ParamField>
+
+<ParamField body="COMPOSIO_API_KEY" type="string">
+  Grasp's API key for the client's Composio project. While unset, nothing from Composio is offered or reachable — tools, actions, and MCP servers backed by Composio are silently unavailable.
+
+  **Source:** `src/composio.ts`
+</ParamField>
+
+---
+
+## Local development
+
+Copy `.dev.vars.example` to `.dev.vars` in each app and fill in the required secrets. Wrangler loads only the secrets listed in `secrets.required` from `.dev.vars` — it ignores anything else in that file.
+
+<Tabs>
+  <Tab title="apps/core/.dev.vars">
+    ```bash
+    # Shared with the router. vp run dev skips the router-secret check for
+    # localhost requests, so this can stay empty during local development.
+    ROUTER_SECRET=
+
+    # Signs session cookies and encrypts sign-in state.
+    # vp run dev signs people in through a local fake IdP (scripts/dev.ts):
+    # any email at acme.test, and admin@acme.test as an admin.
+    BETTER_AUTH_SECRET=
+
+    # Signs the capability each call to connect carries.
+    # Must match the value in apps/connect/.dev.vars.
+    CAPABILITY_SIGNING_KEY=
+    ```
+  </Tab>
+  <Tab title="apps/connect/.dev.vars">
+    ```bash
+    # Verifies the capability core signs for each call.
+    # Must match the value in apps/core/.dev.vars.
+    CAPABILITY_SIGNING_KEY=
+    ```
+  </Tab>
+</Tabs>
+
+<Tip>
+  Generate suitable secret values with `openssl rand -base64 32`. Use the same `CAPABILITY_SIGNING_KEY` value in both `.dev.vars` files — a mismatch causes every core-to-connect call to fail with a signature error.
+</Tip>
+
+Deployment config vars (`SIGN_IN`, `MODEL_GATEWAY`, etc.) are not loaded from `.dev.vars`. Pass them on the command line when you need them locally:
+
+```bash
+wrangler dev --var SIGN_IN:'{"providers":["google"],"domains":["acme.test"]}'
+```

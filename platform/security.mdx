@@ -1,0 +1,245 @@
+---
+title: "Grasp OS Security Architecture and Threat Model"
+sidebarTitle: "Security"
+description: "Sandbox isolation, connector egress controls, EU data jurisdiction, deny-by-default permissions, restricted data, audit integrity, and secrets management."
+---
+
+Grasp OS is deployed once per client in the client's own Cloudflare account. Each deployment is therefore a separate security domain: there is no shared runtime, no shared database, and no path between clients. The security architecture is layered — isolation at the App sandbox, access control at every call, data jurisdiction baked into resource creation, and a tamper-evident audit chain over everything that happens.
+
+## App sandbox model
+
+App code (server methods and workflow steps) runs in a Worker Loader isolate that is deliberately denied the capabilities core's own Workers have.
+
+```typescript
+// From apps/core/src/app.ts — comments on the sandbox constraints
+// An App's server code runs as a facet of the App's own Durable Object:
+// loaded through the Worker Loader from the App's current version, with a
+// SQLite database of its own that stays when the code changes. The App is
+// code nobody reviewed line by line (the agent writes it), so its isolate
+// has no network (`globalOutbound: null`), can't import core's env
+// (`disallow_importable_env`), and its env holds only stubs for the App's
+// active permissions (app-bindings.ts), never one of core's own bindings.
+```
+
+<CardGroup cols={2}>
+  <Card title="No outbound network" icon="network-wired">
+    The isolate is started with `globalOutbound: null`. App code cannot make any direct network request. All external access must go through a permission stub, which routes through connect.
+  </Card>
+  <Card title="No platform bindings" icon="shield-halved">
+    The App's env holds only stubs for its own active permissions — never core's own bindings (`AUDIT_LOG`, `WORKSPACES`, `DB`, `CONNECT`, and so on). A stub cannot be mistaken for a platform binding. The full exclusion list is enforced by `platformBindingNames` in `@grasp-os/shared/permissions`.
+  </Card>
+  <Card title="Caller tokens" icon="key">
+    Every call into an App from a screen, a workflow, or another App carries a caller token — a short-lived, per-call secret that only the App's Durable Object knows. App code cannot name a person itself; it passes the token to its stubs, which ask the object who the token belongs to. The token stops working the moment the call ends.
+  </Card>
+  <Card title="Version-gated access" icon="code-branch">
+    A call carries the App version whose code made it (`appVersion`). Only a version an admin has reviewed and activated can exercise its permissions. The host sets this field — App code cannot claim a different version.
+  </Card>
+</CardGroup>
+
+### What App code cannot do
+
+Even with a legitimate caller token and active permissions, App code is structurally prevented from:
+
+- Making any request outside the declared routes of its permission stubs
+- Accessing another App's data directly (only through declared App-to-App export permissions)
+- Logging its own errors with arbitrary text to the platform log (error names from the runtime are safe to log; App-generated names are not)
+- Returning non-serialisable values from its methods (only plain data passable through structured clone is accepted)
+
+## Connector security
+
+All external calls go through the connect Worker — the only place OAuth tokens live and the only egress point in the system.
+
+```typescript
+// From packages/connector-kit/src/connector.ts — comments on the threat model
+// A connector reaches its provider with plain `fetch`. The isolate's only
+// way out is connect's egress handler, which adds the connection's token
+// and lets through only the requests the called tool declares: the token
+// is never in the isolate, and nothing else is reachable (threat model R9).
+```
+
+<Tabs>
+  <Tab title="Token isolation">
+    OAuth tokens are held by connect and **never enter the App isolate**. Connect adds the token to the egress request after validating the capability token that core signed for this call. App code never sees a raw credential.
+  </Tab>
+  <Tab title="Egress rules">
+    Every connector tool declares its `routes` — the only HTTP paths it may call. Connect's egress handler enforces this per tool: a request to any undeclared path is refused. At most one route per tool may write (non-GET, non-HEAD).
+
+    ```typescript
+    // From packages/connector-kit/src/connector.ts — ToolDefinition
+    /**
+     * The only requests it may send (threat model Q11). A path parameter
+     * named after the resource property (`{mailbox}`) must hold the resource
+     * a call's capability names, whenever it names one. Where the provider
+     * can't name the resource in the path, the tool's own code holds the
+     * call to it. At most one route writes (not GET or HEAD).
+     */
+    routes: readonly Route[];
+    ```
+  </Tab>
+  <Tab title="Capability tokens">
+    Core signs a capability token for every call to connect. Connect checks the token's signature on every request, verifying that core authorised this specific action for this specific caller. Tokens are short-lived and scoped to the call.
+  </Tab>
+  <Tab title="notPerformed marker">
+    A tool that could not have changed anything at the provider — such as a 429 response before any write went out — may set `notPerformed: true` on its `ToolError`. This is the safe-to-retry marker: the caller may retry with the same idempotency key. A tool must only set it when that is certain; a timeout or 5xx after a write has already been sent is not `notPerformed`.
+
+    ```typescript
+    // From packages/connector-kit/src/connector.ts — ToolError
+    /**
+     * `notPerformed: true` says the tool did nothing at all, so it may be
+     * tried again with the same idempotency key (`notPerformedMetaKey`): say,
+     * the provider answered 429 to the tool's first and only write. Set it
+     * only when that is certain.
+     */
+    readonly notPerformed: boolean;
+    ```
+  </Tab>
+</Tabs>
+
+### Input schema strictness
+
+Every tool's input schema must be strict all the way down — `z.strictObject` at every level, no `z.unknown()`, no `z.any()`, no loose objects, no records. `defineTool` refuses a schema that leaves anything open. This ensures that nothing but the declared `resource` property can select a resource, and that connect's pre-call inspection sees the same schema that the tool validates against.
+
+## EU data jurisdiction
+
+Grasp OS is deployed in the EU by default. Jurisdiction is set **at resource creation** and cannot be changed after the fact.
+
+```jsonc
+// From apps/core/wrangler.jsonc — R2 buckets pinned to the EU
+{ "binding": "FILES",         "bucket_name": "grasp-os-files",         "jurisdiction": "eu" }
+{ "binding": "AUDIT_ARCHIVE", "bucket_name": "grasp-os-audit-archive", "jurisdiction": "eu" }
+```
+
+```typescript
+// From AGENTS.md — Durable Objects and D1
+// EU jurisdiction is set when a resource is created
+// (R2 `jurisdiction`, Durable Object `jurisdiction("eu")`, D1 location).
+```
+
+<CardGroup cols={3}>
+  <Card title="R2 buckets" icon="bucket">
+    All R2 buckets are created with `jurisdiction: 'eu'`. The deploy script verifies this before every staging deploy and refuses to proceed if a bucket exists outside the EU.
+  </Card>
+  <Card title="Durable Objects" icon="server">
+    All Durable Objects use `jurisdiction("eu")` so their storage and compute are pinned to the EU.
+  </Card>
+  <Card title="D1 databases" icon="database">
+    D1 is created with the `eu` location hint (`weur`). The CI deploy script checks every database's jurisdiction before deploying and exits non-zero if any is outside the EU.
+  </Card>
+</CardGroup>
+
+<Warning>
+Jurisdiction is set only at creation. A resource created outside the EU cannot be migrated — it must be recreated. The deploy scripts check this automatically for staging; apply the same care when provisioning new client deployments through the console.
+</Warning>
+
+The one resource that cannot be pinned by jurisdiction is Workflows, which takes only a location hint (`weur`). Cloudflare may not always honour it, but it is always set.
+
+## Access control
+
+Grasp OS uses a deny-by-default permission model. Apps and agents start with access to nothing.
+
+```typescript
+// From packages/shared/src/permissions.ts — permission statuses
+// Requested: asked for, allows nothing yet.
+// Active: granted, allows its actions.
+// Revoked: allows nothing, for good (ask again for a new one).
+export const permissionStatusSchema = z.enum(["requested", "active", "revoked"]);
+```
+
+Every call re-checks the session (is the person still a member?) and the permission (is it still active? is the version current?). There is no cached access decision that a permission revoke would not immediately invalidate.
+
+### Permission objects and actions
+
+A permission names its object type, its object ID, and the specific actions it allows:
+
+| Object type | Actions |
+|---|---|
+| `connection` | The connector's tool names, e.g. `mail.list`, `mail.send` |
+| `collection` | `read`, `write` |
+| `workflow` | `read`, `start` |
+| `app` | `read`, `write`, or a named export |
+| `platform` | `statistics`, `guests` |
+
+At most 16 actions per permission. Permissions are identified by a binding name (`OUTLOOK`, `CALENDAR`) that must be upper-case and must not clash with any platform binding.
+
+### Admin review on grant
+
+When an admin grants a permission, they record `reviewed.version` — the version of the App current at the moment they decided. The grant approves that version. If a different version becomes current before the admin clicks "Grant", the grant is refused with `app.conflict` and nothing changes. The admin must review the new version and grant again.
+
+<Info>
+Making a new App version current re-gates sensitive permissions. Any active permission for a write-capable connection, collection write, workflow start, or non-read App export reverts to `requested` until an admin grants it again on the new version.
+</Info>
+
+### Restricted data
+
+Once an App, agent, or workflow run reads from a restricted source, it — and its caller — enter restricted mode. In restricted mode, writing to or fetching from outside systems is refused.
+
+```typescript
+// From packages/shared/src/permissions.ts — the error message
+"permission.restricted":
+  "This chat, App or run has read restricted data, so it can no longer act on or fetch from outside systems."
+```
+
+Restricted mode is tracked per work context (chat, App, or run) and is permanent for that context. It cannot be cleared by the App or by the person using it.
+
+## Audit and observability
+
+Every action taken by any actor — person, App, agent, workflow, or system — is written to the hash-chained audit log. See [Audit Log](/platform/audit-log) for full details on the chain, retention, and admin operations.
+
+Beyond the audit log, the platform observability configuration is deliberately conservative:
+
+```jsonc
+// From apps/core/wrangler.jsonc — observability config
+"observability": {
+  "enabled": true,
+  "redact_query_string": true,        // OAuth callback carries code and state
+  "logs": { "invocation_logs": false }, // headers and bodies are never logged
+  "traces": { "enabled": true }
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="Query strings redacted" icon="eye-slash">
+    All query strings are redacted from logs and traces. The OAuth callback carries the authorisation code and state parameter in the query string; redacting it prevents credentials from appearing in observability tooling.
+  </Card>
+  <Card title="No invocation logs" icon="ban">
+    Invocation logs (request headers and bodies) are disabled. Core logs only the events it needs through `@grasp-os/shared/log`, never raw HTTP content.
+  </Card>
+</CardGroup>
+
+## Secrets management
+
+<Steps>
+  <Step title="Wrangler + 1Password">
+    All secrets are managed through Wrangler and the 1Password shell plugin. In CI, the `1password/load-secrets-action` fetches secrets into the environment just-in-time. Service accounts are limited to their own 1Password vault; the staging account cannot read the ops vault, and vice versa.
+  </Step>
+  <Step title="Never in wrangler.jsonc">
+    Secrets are never committed to `wrangler.jsonc`. Required secrets are listed under the `"secrets"` key so that deploys fail fast if one is missing, but the values are not in the file.
+
+    ```jsonc
+    // From apps/core/wrangler.jsonc — required secrets declared but not valued
+    "secrets": {
+      "required": [
+        "ROUTER_SECRET",
+        "BETTER_AUTH_SECRET",
+        "CAPABILITY_SIGNING_KEY"
+      ]
+    }
+    ```
+  </Step>
+  <Step title="secretlint on every commit">
+    `secretlint` (configured in `.secretlintrc.json` using `@secretlint/secretlint-rule-preset-recommend`) scans every commit for credential patterns. `vp run check:secrets` runs it in CI. A commit that introduces a secret pattern fails the check job.
+  </Step>
+  <Step title=".dev.vars for local development only">
+    Local development secrets go in `.dev.vars`, which is gitignored. Wrangler loads only the required secrets and declared vars from it. Never commit `.dev.vars`. Use `wrangler dev --var NAME:<value>` to pass deployment config vars locally.
+  </Step>
+</Steps>
+
+<Warning>
+Never commit secrets, client names, or client configuration. `secretlint` checks every commit, and CI checks every pull request. If you accidentally commit a secret, rotate it immediately — do not just delete it from the history.
+</Warning>
+
+## Security-critical code
+
+Code in the sandbox, permissions, and connector layers starts from its threat model. The testing rule for this code is: **write the ways it can fail first, including deliberate attacks, then the code**.
+
+Issues labelled **Security** in Linear are reviewed by a person before merge — the normal merge queue alone is not sufficient. If you believe your change has security implications that aren't covered by an existing threat model entry, raise it in the issue before opening a pull request.

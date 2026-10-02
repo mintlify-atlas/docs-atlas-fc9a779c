@@ -1,0 +1,131 @@
+---
+title: "Grasp OS Release Process and App Version Lifecycle"
+sidebarTitle: "Releases"
+description: "How code moves from a pull request on main to clients worldwide — covering CI, staged rollouts, feature flags, and the App version lifecycle."
+---
+
+Grasp OS follows a strict trunk-based delivery model: one long-lived branch, one continuous path from merge to deployment, and client rollouts that proceed ring by ring through the console. Understanding how a change travels from your editor to a client's deployment — and the safeguards along the way — helps you move fast without breaking things.
+
+## Branch and pull request flow
+
+Every change starts from `main`. Name your branch after its commit type:
+
+```bash
+feat/audit-export
+fix/connector-egress-timeout
+chore/deps-zod-upgrade
+```
+
+A pre-push hook and CI both check the name. Once your branch is ready, open a pull request into `main` and let CI run.
+
+<Steps>
+  <Step title="Open a pull request into main">
+    CI runs the full suite: format, lint, type-check (`vp check`), secret scan (`check:secrets`), migration integrity (`check:migrations`), Wrangler config validation, all integration tests in workerd, a Playwright end-to-end pass, an on-prem smoke test, and a dry release build. A PR from a fork never runs the jobs that need secrets.
+  </Step>
+  <Step title="CODEOWNERS review">
+    Nick or Jakob approves (CODEOWNERS). Pushing new commits after an approval invalidates it — a fresh approval is needed.
+  </Step>
+  <Step title="Merge queue">
+    Add the pull request to the merge queue. The queue tests it **on top of the latest `main`** and squash-merges it once tests pass. There is no need to rebase by hand; the queue handles sequencing.
+  </Step>
+  <Step title="Squash merge">
+    The PR title becomes the single commit on `main` and the release note in the console. The title must follow Conventional Commits (`feat(core): …`, `fix(connect): …`).
+  </Step>
+</Steps>
+
+<Note>
+Nobody pushes to `main` directly. The rules live in `.github/rulesets/` and are applied with `vp run github:setup`.
+</Note>
+
+## Conventional Commits
+
+PR titles follow [Conventional Commits](https://www.conventionalcommits.org): `type(scope): description`, where scope is the app or package name (`core`, `connect`, `web`, `console`, `router`, `sdk`, `connector-kit`). A `commit-msg` hook and the `conventions` CI job both enforce it. The squash-merge commit becomes the release note shown in the console, so write titles for operators, not just for reviewers.
+
+```text
+feat(core): add audit log export in CSV format
+fix(connect): retry capability token check on transient 503
+chore(deps): upgrade zod to 3.24.0
+```
+
+## Emergency path
+
+When waiting for a normal review would do more harm than the risk of skipping it, organisation owners can merge a pull request without a second review or passing checks. **GitHub records every bypass** — the event is permanent in the audit log. Use it only in genuine emergencies.
+
+<Warning>
+The emergency path bypasses checks, not safety. Run `vp check` locally before using it, and follow up with a proper PR that adds a regression test.
+</Warning>
+
+## Staging deployment
+
+Every merge to `main` automatically deploys all apps (`core`, `connect`) to `grasp-os-staging` through the `deploy-staging` CI job. The sequence matters:
+
+1. D1 databases are created in the EU jurisdiction if they don't exist yet.
+2. The EU audit archive R2 bucket is created if missing.
+3. `connect` migrations and `connect` deploy run first — `core`'s service binding points at it.
+4. `core` migrations and `core` deploy follow.
+
+Once staging succeeds, `publish-release` builds a release bundle, verifies every blob against its manifest, and uploads it to R2 in `grasp-os-ops`, where the console can import it.
+
+<Info>
+The console and router reach `grasp-os-ops` **only** through the manual **Deploy grasp-os-ops** workflow — never from an automatic push-triggered run. CI never deploys to a client account; that is the console's job.
+</Info>
+
+## Client releases: ring-by-ring rollout
+
+Once a release is published, the console rolls it out to clients. Releases move through deployment rings: a small internal ring first, then a broader pilot ring, then general availability. Staff trigger each ring advance through the console UI.
+
+If a release causes problems at any ring, it can be stopped before it reaches the next. The console shows each deployment's running version, the version available, and the rollout state.
+
+<CardGroup cols={2}>
+  <Card title="Ring rollout" icon="circle-nodes">
+    Releases advance ring by ring. Each ring is a set of client deployments. Staff advance a ring manually; a problem at any ring stops the rollout.
+  </Card>
+  <Card title="Version pinning" icon="pin">
+    Each client deployment runs a specific version. The console shows which version is current, which is available, and the diff of what changed.
+  </Card>
+</CardGroup>
+
+## Feature flags and kill switches
+
+Risky changes ship switched off behind a feature flag. The flag is off in production until the team is confident enough to enable it, which means a release can carry new behaviour that no client sees yet.
+
+For especially sensitive changes — new egress behaviour, schema changes during the expand phase, experimental model routing — a **kill switch** lets staff disable the feature instantly across all deployments without a new release.
+
+<Tip>
+If your change touches security-critical code (sandbox, permissions, connectors), the issue is labelled **Security** in Linear and a person reviews it before merge. Write the threat model first, then the code.
+</Tip>
+
+## App version lifecycle
+
+App code (screens and server logic) goes through its own versioning lifecycle, separate from platform releases.
+
+```text
+commit SHA  →  pending review  →  current (activated)
+```
+
+<Steps>
+  <Step title="Commit">
+    A builder commits a new version of the App. The version is stored with its source files and a SHA that identifies it.
+  </Step>
+  <Step title="Pending review">
+    The version is visible to builders and admins but not yet active. No workflow runs on it; no screen serves it.
+  </Step>
+  <Step title="Workflow tests pass">
+    Before a version can be made current, its workflow tests must pass. A version whose tests fail cannot be activated.
+  </Step>
+  <Step title="Current">
+    A builder or admin calls `AppVersionsApi.setCurrent`. From this point, the App's screens and server code run on the new version. Any active permission that a write-capable connection, collection write, or non-read App export required reverts to **requested** until an admin grants it again — this is the review step that approves what the new code can do.
+  </Step>
+</Steps>
+
+<Note>
+Making a new version current re-gates sensitive permissions deliberately. An admin who grants a permission reviews the version current at that moment (`reviewed.version`). If a different version becomes current before the admin grants, the grant is refused with `app.conflict` and nothing changes — the admin must review again.
+</Note>
+
+## Conflict resolution
+
+When your branch conflicts with `main`:
+
+- **Source files**: rebase on `main`.
+- **Generated files** (lockfile, Worker types, route trees): take either side and regenerate — `vp install`, `vp run -r typegen`, `vp run -r build`.
+- **Migrations**: keep `main`'s migrations, delete your branch's, then run `vp run -r db:generate` to place yours after them. A migration on `main` never changes; `vp run check:migrations` enforces this.

@@ -1,0 +1,125 @@
+---
+title: "Grasp OS System Architecture and Deployment Design"
+sidebarTitle: "Architecture"
+description: "How Grasp OS's five Workers, Durable Objects, D1 databases, R2 buckets, and Cloudflare Workflows fit together in a per-client EU deployment."
+---
+
+Grasp OS is built entirely on Cloudflare's Developer Platform. Each client deployment is an isolated set of Workers, Durable Objects, D1 databases, and R2 buckets provisioned into that client's own Cloudflare account by the Console. Nothing is shared between clients. Every resource is created with an EU jurisdiction, which Cloudflare honours at the storage layer — data at rest stays in the EU from the moment it is first written.
+
+## Repository layout
+
+The monorepo contains five apps and six packages. Apps are Cloudflare Workers; packages are workspace libraries with no separate build step — they export TypeScript source and are consumed directly.
+
+### Apps
+
+| Path | Worker name | What it does |
+|---|---|---|
+| `apps/core` | `grasp-os-core` | Sign-in, knowledge, Apps, workflow engine, model gateway, audit log — the main deployment unit per client |
+| `apps/connect` | `grasp-os-connect` | OAuth token vault, MCP servers, all egress to external systems; reached only through Core's service binding |
+| `apps/web` | *(static assets)* | React SPA, built by Vite and served as static files by Core through the `ASSETS` binding |
+| `apps/console` | *(grasp-os-ops)* | Staff console (TanStack Start) for provisioning and releases; runs in the Grasp Labs ops account |
+| `apps/router` | *(grasp-os-ops)* | Stateless hostname router mapping `*.<domain>` to each client's Core; also runs in the ops account |
+
+### Packages
+
+| Path | Package name | What it provides |
+|---|---|---|
+| `packages/sdk` | `@grasp-os/sdk` | Workflow and screen SDK — the only import App code is allowed |
+| `packages/ui` | `@grasp-os/ui` | shadcn component library on Base UI with Tailwind v4 |
+| `packages/compiler` | `@grasp-os/compiler` | Screen compiler: builds App React screens into Worker-loadable modules |
+| `packages/connector-kit` | `@grasp-os/connector-kit` | Primitives for writing native connectors (manifest, tools, MCP server) |
+| `packages/connectors/*` | *(native connectors)* | Bundled MCP servers for Microsoft 365, Google Workspace, and others |
+| `packages/shared` | `@grasp-os/shared` | Shared TypeScript types and Zod schemas used across apps and packages |
+
+## Runtime request flow
+
+Requests from a client's users follow a fixed path through the system. The Router is the only public entry point; Core and Connect are never directly addressable from the internet.
+
+```
+User browser / API client
+        │
+        ▼
+  ┌───────────┐
+  │  Router   │  grasp-os-ops
+  │  Worker   │  maps *.domain → client Core
+  └─────┬─────┘
+        │  ROUTER_SECRET header
+        ▼
+  ┌───────────┐
+  │   Core    │  client account, EU
+  │  Worker   │  serves Web SPA, handles all API calls
+  └─────┬─────┘
+        │              │
+        │  service     │  model gateway
+        │  binding     │  (Cloudflare AI Gateway)
+        ▼              ▼
+  ┌───────────┐   ┌──────────┐
+  │  Connect  │   │   AI     │
+  │  Worker   │   │ binding  │
+  └───────────┘   └──────────┘
+```
+
+Every request the Router forwards carries a `ROUTER_SECRET` header that Core validates — requests without it are refused even before the static-asset layer is reached. Connect is bound to Core as a service binding (`CONNECT`) and is never reachable from the public internet. The model gateway in Core uses Cloudflare's `AI` binding with `remote: true` so provider keys never live in Core; they stay in Cloudflare AI Gateway.
+
+## Core architecture
+
+Core is the largest Worker. Its internal components are:
+
+- **Sign-in** — Better Auth session management, supporting Microsoft Entra and Google Workspace IdPs via deployment configuration.
+- **Workspace Durable Object** — Per-deployment mutable state (feature flags, settings, registered Apps).
+- **App Durable Object** — Sandboxed runtime for each App: its server class, its screens (via the `LOADER` worker loader), and its permissions.
+- **Workflow engine** — A single `WorkflowDispatcher` Cloudflare Workflow that loads and runs any App's workflow code by App ID and pinned version. Runs are created with the `weur` location hint.
+- **Model gateway** — Validates deployment rules (jurisdiction, budgets, data sensitivity) and forwards to AI Gateway via the `AI` binding.
+- **Audit log** — An `AuditLog` Durable Object that stores events in a hash chain; events past the retention window are moved to the `AUDIT_ARCHIVE` R2 bucket.
+- **Builtins** — A single `Builtins` Durable Object that installs platform-level content (built-in skills and knowledge) when a new version ships.
+- **Cron jobs** — A cron every minute: flushes audit outboxes, fires schedule triggers, records platform-update events. A second cron every 15 minutes: improvement signals and App knowledge sync.
+
+## Connect architecture
+
+Connect holds every secret that touches outside systems. It is reached only through the service binding from Core, and every call it receives carries a signed capability token (`CAPABILITY_SIGNING_KEY`, shared with Core) that encodes what the caller is allowed to do. It never makes a call that its capability doesn't authorise.
+
+- **OAuth vault** — Encrypted OAuth tokens (`TOKEN_ENCRYPTION_KEY`) for Microsoft 365 and Google Workspace connections.
+- **Native MCP servers** — Each connector from `packages/connectors/*` runs in its own worker-loader isolate, loaded on demand.
+- **Composio bridge** — Third-party connector access via Composio's API and MCP servers.
+- **Cron** — Every minute: drops unfinished OAuth flows, cleans up Composio leftovers, re-seals tokens under a rotated key.
+
+## Data stores
+
+Core provisions five categories of storage resource for each client deployment, all in the EU:
+
+| Resource | Binding | Purpose |
+|---|---|---|
+| D1 `grasp-os-core` | `DB` | Core relational data: users, teams, roles, permissions, Apps catalogue |
+| D1 `grasp-os-knowledge` | `KNOWLEDGE` | Knowledge base entries and embeddings |
+| D1 `grasp-os-connect` | `DB` (in Connect) | OAuth connections, Composio mappings |
+| R2 `grasp-os-files` | `FILES` | File uploads and App attachments, `jurisdiction: "eu"` |
+| R2 `grasp-os-audit-archive` | `AUDIT_ARCHIVE` | Archived audit events past retention, `jurisdiction: "eu"` |
+
+Durable Objects use SQLite storage and are pinned to the EU via `jurisdiction("eu")` at creation time. Cloudflare Workflows cannot be hard-pinned to a jurisdiction, so each run is created with the `weur` location hint — a preference Cloudflare may not always honour.
+
+Each app keeps its own Drizzle schemas and migrations under `src/db/`. Core has two schema sets (`src/db/core/` and `src/db/knowledge/`); Connect has one (`src/db/`). Migrations follow expand-then-contract: columns are added before they are removed, and code must work against both the old and the new schema at the same time.
+
+## EU jurisdiction strategy
+
+EU data residency is a first-class constraint, not an afterthought:
+
+- **D1 databases** are created with the EU location hint through the Console.
+- **R2 buckets** are created with `jurisdiction: "eu"` and the binding in `wrangler.jsonc` carries the same flag, so even a misconfigured deploy can't write to a non-EU bucket.
+- **Durable Objects** call `jurisdiction("eu")` on every new object ID. The object's storage follows it to the EU.
+- **Cloudflare Workflows** receive the `weur` location hint on every run creation.
+- **The AI binding** uses `remote: true`; the gateway's region is configured in Cloudflare's dashboard.
+
+<Note>
+  Grasp OS is designed to also run on [workerd](https://github.com/cloudflare/workerd) for on-premises deployments. Only platform APIs that also exist on workerd are used; platform services (storage, mail, the model gateway) sit behind adapter interfaces so the on-prem profile can substitute local equivalents. Run `vp run smoke:workerd` to verify Core boots cleanly on plain workerd.
+</Note>
+
+## Architectural rules
+
+Several constraints are enforced across the whole codebase, not just in individual apps:
+
+- **Every external call goes through Connect.** Apps and workflows never make raw outbound HTTP requests. They call a connector through a permission binding, which Core forwards to Connect with a signed capability.
+- **Every model call goes through the model gateway.** No Worker imports an AI SDK directly. All LLM calls go through Core's gateway, which applies deployment rules before forwarding.
+- **Apps and agents start with access to nothing.** Every permission — to a connector, to another App's exports, to a knowledge collection — is explicitly granted by an admin. There is no ambient access.
+- **Screens never run in the background.** Only workflows run autonomously. Screens are UI surfaces; they cannot register hooks or make side-effecting calls outside a user interaction.
+- **Workflow code imports only `@grasp-os/sdk`.** It never imports from the engine, from Core's internals, or from platform packages. The SDK is the isolation boundary.
+- **Only workerd-compatible platform APIs are used.** This keeps the on-prem profile viable without forking the codebase.

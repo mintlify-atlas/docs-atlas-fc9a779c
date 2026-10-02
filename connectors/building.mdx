@@ -1,0 +1,302 @@
+---
+title: "Building Native Connectors with connector-kit"
+sidebarTitle: "Building"
+description: "How to define MCP tools, handle provider errors, and assemble a full connector using @grasp-os/connector-kit's defineTool and defineConnector APIs."
+---
+
+`@grasp-os/connector-kit` is the only package a native connector needs. It provides `defineTool` for describing and running individual tools, `ToolError` for surfacing actionable failures, and `defineConnector` for assembling them into a stateless MCP server that Connect can call. A connector's code never touches OAuth tokens: it calls `fetch` with a plain URL, and Connect's egress handler adds the credential and enforces the route allowlist the tool declared. This keeps the security boundary clean even if a connector's isolate is compromised.
+
+## `defineTool(definition)`
+
+`defineTool` takes a `ToolDefinition` and returns a validated `Tool` object ready to be passed to `defineConnector`. It throws immediately if the definition breaks the connector contract — for example, if the input schema leaves any key open (uses `z.unknown()`, a loose object, or a record) or if the declared `resource` property is not a string field of the input.
+
+### Fields
+
+<ParamField path="name" type="string" required>
+  The action's name, exactly as permissions name it. Use dot notation to group related tools, e.g. `mail.list`, `mail.send`, `files.read`. Names match exactly — no case folding, no normalising.
+</ParamField>
+
+<ParamField path="description" type="string" required>
+  A human-readable description of what the tool does. This is what `tools/list` returns and what an LLM sees when choosing a tool.
+</ParamField>
+
+<ParamField path="input" type="z.ZodObject" required>
+  The tool's input schema. **Must be `z.strictObject` all the way down** — every nested object must also be strict, and no `z.unknown()`, `z.any()`, records, or loose objects are allowed anywhere in the tree. `defineTool` verifies this by converting the schema to JSON Schema and checking that every node is closed. Unknown keys are refused, never silently dropped.
+
+  Do not use `.preprocess` or `.transform` on any property that selects a resource: such transforms can rename or alias a key, making it invisible to the schema check.
+</ParamField>
+
+<ParamField path="output" type="z.ZodObject" required>
+  The tool's output schema. Must also be a strict object. Connect reads `structuredContent` only, so the output is never sent twice as text.
+</ParamField>
+
+<ParamField path="readOnly" type="boolean" required>
+  `true` for tools that only read data. Read-only tools run without an idempotency key — retrying them is always safe. Non-read-only tools require a key, and Connect holds them for user confirmation if the call comes from an interactive context.
+</ParamField>
+
+<ParamField path="destructive" type="boolean">
+  Whether the tool may destroy data. Defaults to `!readOnly`. A write tool that creates but does not delete anything (e.g. `mail.send`) should explicitly set `destructive: false`.
+</ParamField>
+
+<ParamField path="resource" type="string">
+  The name of the one input property that selects the resource the tool acts on — a mailbox address, a drive ID, a calendar ID. A permission can then be scoped to a single resource, and Connect's egress binds every outbound request to it. No other input property, at any depth, may select a resource. The property must be a string field of `input`.
+</ParamField>
+
+<ParamField path="routes" type="Route[]" required>
+  The only HTTP requests this tool may send, each as `{ method, host, path }`. The path is a template: a `{name}` segment takes any one URL-safe value. A segment named after `resource` (e.g. `{mailbox}`) is bound to the resource the call's capability names. **At most one route may write** (use a method other than `GET` or `HEAD`), because idempotency guarantees only hold when a tool's single write is its last action.
+
+  ```ts
+  routes: [
+    { method: "GET", host: "graph.microsoft.com", path: "/v1.0/users/{mailbox}/messages" },
+    { method: "POST", host: "graph.microsoft.com", path: "/v1.0/users/{mailbox}/sendMail" },
+  ]
+  ```
+
+  A `GET` route may also declare `redirects` — a list of wildcard hosts (`*.sharepoint.com`) that Connect's egress will follow one redirect to, without the provider token. This is how OneDrive file downloads work.
+</ParamField>
+
+<ParamField path="describe" type="object">
+  How a pending-action confirmation displays the call to the user who must approve it. If omitted, they see the raw action name and JSON input.
+
+  - `title` — a verb phrase describing the action, e.g. `"Send an email"`.
+  - `fields` — an array of `{ label, input }` pairs, each mapping an input property to a human label. **Every property that changes what the call does must appear here** — the UI tells the user when the input holds more than what `fields` shows.
+
+  ```ts
+  describe: {
+    title: "Send an email",
+    fields: [
+      { label: "From", input: "mailbox" },
+      { label: "To", input: "to" },
+      { label: "Subject", input: "subject" },
+      { label: "Body", input: "body" },
+    ],
+  }
+  ```
+</ParamField>
+
+<ParamField path="run" type="(input: z.output<Input>) => Promise<ToolResult<z.input<Output>>>" required>
+  The tool's async implementation. Receives the validated, parsed input. Must return `{ output, provenance? }` where `output` matches the declared output schema and `provenance` is an optional array of provider-side resource IDs that the output came from (message IDs, file IDs, etc.).
+
+  Throw `ToolError` for any expected failure the caller can act on. Any other thrown value becomes the generic message `"The action failed"` — never expose raw provider error messages, which can repeat what was sent.
+</ParamField>
+
+### Return value: `ToolResult`
+
+```ts
+interface ToolResult<Output> {
+  output: Output;
+  /** The provider's IDs of the resources the output came from. */
+  provenance?: readonly string[];
+}
+```
+
+## `ToolError`
+
+`ToolError` is the only error class whose message the caller may see. Throw it for failures the caller can do something about — a missing item, a rate limit, an access denial. Anything else (a network timeout, a bug in the connector) should be left as an unhandled error and will surface as `"The action failed"`.
+
+```ts
+throw new ToolError("No such message", { code: "not_found" });
+throw new ToolError("Rate limited; try again later", {
+  code: "throttled",
+  retryAfterSeconds: 60,
+  notPerformed: true,
+});
+```
+
+### Constructor
+
+```ts
+new ToolError(message: string, options?: {
+  code?: ToolErrorCode;
+  retryAfterSeconds?: number;
+  notPerformed?: boolean;
+})
+```
+
+<ParamField path="message" type="string" required>
+  A human-readable message the caller may show. Do not repeat input values here.
+</ParamField>
+
+<ParamField path="code" type="ToolErrorCode">
+  A machine-readable code the caller can branch on. See the table below.
+</ParamField>
+
+<ParamField path="retryAfterSeconds" type="number">
+  How long the provider asks callers to wait before retrying. Only meaningful with `code: "throttled"` or `code: "unavailable"`.
+</ParamField>
+
+<ParamField path="notPerformed" type="boolean">
+  `true` means the tool did **nothing at all**, so the call may be retried with the same idempotency key. Set this only when certain — e.g. the provider returned 429 before any write went out. A write that may have reached the provider must not set this. A read-only tool may set it for any transient failure, because reads change nothing.
+</ParamField>
+
+### `ToolErrorCode` values
+
+| Code | Meaning |
+|---|---|
+| `invalid` | The tool or provider refused the input as not valid |
+| `egress_refused` | Connect's egress refused the request (a route mismatch — a connector bug) |
+| `egress_failed` | Connect's egress withheld the provider's answer (a redirect, or unreachable) |
+| `throttled` | The provider is rate-limiting requests; nothing was done |
+| `unavailable` | The provider is temporarily unavailable |
+| `access_denied` | The provider refused access (401 or 403) |
+| `not_found` | The provider has no such item (404) |
+| `failed` | The provider answered with an error not covered above |
+| `too_large` | The content exceeds the read limit |
+| `not_text` | The content can't be decoded as text |
+| `not_a_file` | The item exists but isn't a file |
+
+## `defineConnector(definition)`
+
+`defineConnector` assembles a set of tools into a complete MCP server. It validates the manifest — for example, checking that every route's host appears in `hosts`, that every `describe` field references a real input property, and that no two tools share a name — and returns a `Connector` with a `fetch` handler Connect calls directly.
+
+```ts
+import { defineConnector } from "@grasp-os/connector-kit/connector";
+
+export default defineConnector({
+  name: "my-connector",
+  version: "1.0.0",
+  provider: "microsoft",
+  scopes: ["Mail.Read"],
+  hosts: ["graph.microsoft.com"],
+  tools: [listMessages, getMessage],
+});
+```
+
+### `ConnectorDefinition` fields
+
+<ParamField path="name" type="string" required>
+  A lowercase, hyphen-separated identifier, e.g. `microsoft-365`. Must match `/^[a-z][a-z0-9-]{0,62}$/`.
+</ParamField>
+
+<ParamField path="version" type="string" required>
+  Semantic version string, e.g. `"0.2.0"`. Must match `\d{1,4}.\d{1,4}.\d{1,4}`.
+</ParamField>
+
+<ParamField path="provider" type='"microsoft" | "google"' required>
+  Which OAuth provider's token Connect attaches to egress requests. Every tool in the connector shares the same provider.
+</ParamField>
+
+<ParamField path="scopes" type="string[]" required>
+  The OAuth scopes the connector's tools collectively need. These must be a subset of the scopes Connect requested when the connection was made.
+</ParamField>
+
+<ParamField path="hosts" type="string[]" required>
+  Every hostname the connector may reach, exactly. No wildcards; at most 16. Every route declared in any tool must use one of these hosts, enforced at build time by `defineConnector` and again at request time by Connect's egress.
+</ParamField>
+
+<ParamField path="tools" type="Tool[]" required>
+  The tools this connector exposes. Each must have been created with `defineTool`. No two tools may share a name.
+</ParamField>
+
+### Return value: `Connector`
+
+```ts
+interface Connector {
+  manifest: ConnectorManifest;
+  /** Answers one MCP request (Streamable HTTP, JSON responses, stateless). */
+  fetch: (request: Request) => Promise<Response>;
+}
+```
+
+`manifest` is the validated, serialisable description of the connector that Connect loads at build time to decide — without running the connector — which provider token to attach and which routes to allow. `fetch` is a standard `(Request) => Promise<Response>` handler that implements the MCP JSON-RPC 2.0 protocol.
+
+## Minimal Example: A Read-Only Listing Tool
+
+The following shows a complete, minimal connector with one read-only tool that lists items from a hypothetical API.
+
+```ts
+import { defineConnector, defineTool, ToolError } from "@grasp-os/connector-kit/connector";
+import { z } from "zod";
+
+const listItems = defineTool({
+  name: "items.list",
+  description: "Lists items in an account, newest first.",
+  input: z.strictObject({
+    account: z.email().max(256),
+    top: z.number().int().min(1).max(100).optional(),
+  }),
+  output: z.strictObject({
+    account: z.string(),
+    items: z.array(
+      z.strictObject({
+        id: z.string(),
+        name: z.string(),
+        createdAt: z.string().nullable(),
+      })
+    ),
+    nextPage: z.string().nullable(),
+  }),
+  readOnly: true,
+  resource: "account",
+  routes: [
+    {
+      method: "GET",
+      host: "api.example.com",
+      path: "/v1/accounts/{account}/items",
+    },
+  ],
+  run: async ({ account, top }) => {
+    const url = new URL(
+      `https://api.example.com/v1/accounts/${encodeURIComponent(account)}/items`
+    );
+    if (top !== undefined) url.searchParams.set("limit", String(top));
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new ToolError("No such account", { code: "not_found" });
+      }
+      throw new ToolError(`The service answered ${response.status}`, {
+        code: "failed",
+      });
+    }
+
+    const data = await response.json() as { items: { id: string; name: string; createdAt?: string }[] };
+    return {
+      output: {
+        account,
+        items: data.items.map((item) => ({
+          id: item.id,
+          name: item.name,
+          createdAt: item.createdAt ?? null,
+        })),
+        nextPage: null,
+      },
+      provenance: data.items.map((item) => item.id),
+    };
+  },
+});
+
+export default defineConnector({
+  name: "example-service",
+  version: "1.0.0",
+  provider: "microsoft",  // whichever provider's token this connector uses
+  scopes: ["api://example/.default"],
+  hosts: ["api.example.com"],
+  tools: [listItems],
+});
+```
+
+<Note>
+  The `fetch` call inside `run` is a plain browser-compatible `fetch`. Connect's egress intercepts it transparently — the connector code does not import or configure anything special for HTTP. The token is never available to the connector's code.
+</Note>
+
+## Key Constraints
+
+<Accordion title="Input must be strict all the way down">
+  Every object in the input tree must use `z.strictObject`, not `z.object`. `defineTool` converts the schema to JSON Schema and verifies that every node is closed: no `additionalProperties: true`, no `z.unknown()`, no `z.any()`, no records. A schema that leaves anything open is rejected immediately, before any call runs.
+
+  Additionally, do not use `.preprocess` or `.transform` on properties involved in resource selection. These run outside the JSON Schema that `defineTool` inspects, so they can alias or rename keys invisibly.
+</Accordion>
+
+<Accordion title="At most one write route per tool">
+  A tool may declare multiple `GET` routes but at most one write route (any method other than `GET` or `HEAD`). This is because idempotency guarantees assume the tool's single write is its last action: if two writes were possible, a retry after the first succeeded but the second failed could not safely replay. `defineConnector` enforces this and will throw if violated.
+</Accordion>
+
+<Accordion title="Module state is forbidden">
+  Connect may spin up a fresh isolate for every call. While the platform currently keeps isolates warm, a connector's correctness must not depend on it. Do not store anything in module-level variables between calls. Every call must be self-contained.
+</Accordion>
+
+<Accordion title="notPerformed must be set conservatively">
+  `notPerformed: true` on a `ToolError` tells Connect the call did nothing, freeing its idempotency key for a retry. Set it only when you are certain: the provider returned a rate-limit response (429) before your tool's write request was sent, or the provider returned 503 to a read. Never set it after a write that may have reached the provider, after a timeout, or after a 5xx on a write. The `providerFetch` helper from `@grasp-os/connector-kit/provider` sets it automatically in the safe cases.
+</Accordion>

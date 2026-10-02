@@ -1,0 +1,201 @@
+---
+title: "workflow() — Defining and Exporting Grasp Workflows"
+sidebarTitle: "Workflow Entry"
+description: "workflow() declares params, an input schema, triggers, and the run function the engine replays. It is the sole entry point for every Grasp OS workflow."
+---
+
+Every workflow in Grasp OS begins with a single call to `workflow()`. This function validates your definition eagerly — a bad workflow ID, an invalid parameter default, or a trigger that references a non-existent schedule parameter will throw at load time, before any run can start. The result is a `WorkflowDefinition` that the runtime holds and re-runs durably, step by step, with full replay semantics. Export it as the file's default export and the platform picks it up automatically.
+
+```ts
+import { workflow } from '@grasp-os/sdk/workflow';
+```
+
+---
+
+## Signature
+
+```ts
+workflow(
+  id: string,
+  config: {
+    params: Record<string, Param>;
+    input?: ZodType;
+    triggers?: Trigger[];
+  },
+  async (step: StepRunner, context: WorkflowContext) => Output
+): WorkflowDefinition<Output>
+```
+
+<ParamField path="id" type="string" required>
+  A kebab-case workflow identifier: letters, digits, and hyphens, starting with a letter (e.g. `invoice-approval`). Must be unique within the App. The platform uses this as a stable key across versions — changing it creates a new workflow.
+</ParamField>
+
+<ParamField path="config.params" type="Record<string, Param>" required>
+  A map of named tunable values. Each value is declared with a param helper (`money`, `number`, `text`, `person`, `schedule`, `model`, or `template`). People change these in the UI without touching code.
+</ParamField>
+
+<ParamField path="config.input" type="ZodType" optional>
+  An optional Zod schema describing the run's input. When present, the runtime validates the input before the workflow function runs and fails the run immediately with `workflow.invalid_input` if it doesn't match. Use `input: emailMessage` for email triggers and `input: connectorEvent` for event triggers — both are exported from `@grasp-os/sdk/workflow`.
+</ParamField>
+
+<ParamField path="config.triggers" type="Trigger[]" optional>
+  An array of triggers that start runs automatically. Defaults to `[{ type: 'manual' }]` when omitted. Every trigger type is documented in the [Triggers](/sdk/triggers) reference.
+</ParamField>
+
+<ParamField path="run" type="async (step, context) => Output" required>
+  The workflow's body. Receives a `StepRunner` and a `WorkflowContext`. All side effects, model calls, decisions, and sleeps must go through `step`. Code between steps runs on every replay — keep it pure.
+</ParamField>
+
+---
+
+## WorkflowContext
+
+The second argument to the workflow function carries everything the run needs besides its steps.
+
+<ParamField path="runId" type="string">
+  The unique ID of this run. Stable across replays.
+</ParamField>
+
+<ParamField path="input" type="Output of config.input schema">
+  The validated input passed when the run started. `undefined` when no `input` schema was declared.
+</ParamField>
+
+<ParamField path="params" type="ParamValues<P>">
+  The resolved parameter values for this run, frozen. Read them as `params.threshold`. They are recorded in the first step of every run, so a replay always uses the values the run started with even if someone changes them in between.
+</ParamField>
+
+<ParamField path="env" type="WorkflowEnv">
+  The App's bindings: connections, other Apps' exports, and the App's own server, accessed as `env.NAME.method(…)`, `appServer(env).method(…)`, or `appExports(env.NAME).method(…)`. Bindings only work inside a step's own function — calling them between steps causes a replay error.
+</ParamField>
+
+<ParamField path="readAttachment" type="(message, index) => Promise<Uint8Array>">
+  Reads attachment bytes from an email trigger's message. Must be called inside a step. The message is kept for 30 days; after that the call fails with `workflow.attachment_not_found`. See [Email trigger](/sdk/triggers#email) for details.
+</ParamField>
+
+---
+
+## WorkflowError
+
+`WorkflowError` is thrown for structural problems with the workflow definition or its calls. Its `code` property is stable and machine-readable — branch on `code`, never on `message`.
+
+<AccordionGroup>
+  <Accordion title="workflow.invalid_definition">
+    The workflow definition is invalid: bad ID, invalid parameter declaration or default, or a trigger referencing a non-existent schedule parameter. Thrown at load time.
+  </Accordion>
+  <Accordion title="workflow.invalid_step_call">
+    A step was called incorrectly: bad name, options that fail validation, a step started inside another step, or the same step run twice without a `key`.
+  </Accordion>
+  <Accordion title="workflow.invalid_input">
+    The run's input doesn't match the declared `input` schema. The run fails immediately; retrying won't help.
+  </Accordion>
+  <Accordion title="workflow.invalid_param">
+    A parameter value (either the default or a configured override) doesn't match the param kind's schema. The `$params` step fails, stopping the run.
+  </Accordion>
+  <Accordion title="workflow.invalid_model_output">
+    The model's answer doesn't match the `step.llm` call's `schema`. This is retryable — the engine will ask the model again up to the step's retry limit.
+  </Accordion>
+</AccordionGroup>
+
+`WorkflowError.from(error)` reconstructs a `WorkflowError` from an error that only has its `name` and `message` preserved (as Cloudflare Workflows does for failed steps), making the code recoverable even after a replay boundary.
+
+---
+
+## Complete example
+
+The canonical example from the SDK source: an invoice approval workflow. It declares a `threshold` money param and a `reviewer` person param, reads the invoice amount from its input, and only asks for a decision when the amount exceeds the threshold.
+
+```ts
+import { workflow, money, person, z } from '@grasp-os/sdk/workflow';
+
+export default workflow(
+  'invoice-approval',
+  {
+    params: {
+      threshold: money({
+        label: 'Review invoices above',
+        currency: 'EUR',
+        default: 500_000, // €5,000.00 in cents
+      }),
+      reviewer: person({
+        label: 'Reviewer',
+        default: 'role:finance',
+      }),
+    },
+    input: z.object({
+      invoiceId: z.string(),
+      amount: z.number(),
+      vendor: z.string(),
+    }),
+  },
+  async (step, { input, params, env }) => {
+    if (input.amount > params.threshold) {
+      const decision = await step.decision('review', {
+        description: `Approve invoice from ${input.vendor}`,
+        from: params.reviewer,
+        ask: async ({ recipients, idempotencyKey }) => {
+          await env.MAIL.call('send', {
+            to: recipients,
+            subject: `Invoice approval needed: ${input.invoiceId}`,
+            idempotencyKey,
+          });
+        },
+        timeout: '3 days',
+        remindAfter: '1 day',
+      });
+
+      if (decision.timedOut || !decision.approved) {
+        return { approved: false, reason: decision.timedOut ? 'timed-out' : 'rejected' };
+      }
+    }
+
+    await step.do(
+      'book',
+      {
+        description: 'Book the invoice in the accounting system',
+        sideEffect: true,
+        input: { invoiceId: input.invoiceId, amount: input.amount },
+      },
+      async ({ idempotencyKey, input: stepInput }) => {
+        await env.ACCOUNTING.call('bookInvoice', {
+          ...stepInput,
+          idempotencyKey,
+        });
+      }
+    );
+
+    return { approved: true };
+  }
+);
+```
+
+<Note>
+  Every workflow file must export its `workflow(…)` call as the **default export** — `export default workflow(…)`. The platform only loads the default export, and `describeWorkflow` in `@grasp-os/sdk/describe` reads the step list from the same call. A second `workflow()` call in the same file, or one that isn't the default export, is an error.
+</Note>
+
+---
+
+## ParamValues type
+
+`ParamValues<P>` maps your param record to the runtime values the workflow function receives. It is inferred automatically from `config.params` — you never need to write it by hand.
+
+```ts
+import type { ParamValues } from '@grasp-os/sdk/workflow';
+
+const myParams = {
+  threshold: money({ label: 'Threshold', currency: 'EUR', default: 10_000 }),
+  assignee: person({ label: 'Assignee', default: 'role:admin' }),
+};
+
+type Values = ParamValues<typeof myParams>;
+// { readonly threshold: number; readonly assignee: Person }
+```
+
+---
+
+## Zod re-export
+
+`@grasp-os/sdk/workflow` re-exports `z` from Zod so workflow code has a single import. Use it for `input` schemas and `step.llm` output schemas without adding a separate Zod dependency.
+
+```ts
+import { workflow, z } from '@grasp-os/sdk/workflow';
+```

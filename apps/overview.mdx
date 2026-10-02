@@ -1,0 +1,96 @@
+---
+title: "Grasp OS Apps: Structure, Lifecycle, and Creation"
+sidebarTitle: "Overview"
+description: "Apps are versioned, isolated TypeScript programs deployed as Cloudflare Durable Objects. Learn their file layout, version lifecycle, and how to create one."
+---
+
+A Grasp OS **App** is a self-contained program that lives on your deployment. Its server runs as a Cloudflare Durable Object with its own SQLite database; its screens are sandboxed React components the browser renders in iframes; its workflows are durable, step-by-step automations. Everything — server code, screens, and workflows — is committed together as a single versioned tree of TypeScript files, so every deployed version is an immutable snapshot of the full program.
+
+## File structure
+
+An App is a directory tree at most 8 levels deep. Grasp OS reads specific paths by convention:
+
+| Path | What it is |
+|---|---|
+| `app/server.ts` | The server class — the App's stateful backend, extending `DurableObject` |
+| `app/exports.json` | The methods other Apps may call on this one |
+| `app/records.json` | Record-type declarations for Knowledge collections this App writes |
+| `screens/*.tsx` | React screen components, each compiled into an ES module and CSS |
+| `workflows/*.ts` | Workflow definitions, each exporting a `WorkflowDefinition` |
+
+Beyond those paths you can add shared utilities, types, or data files freely. Anything at `screens/` becomes a screen; anything at `workflows/` becomes a workflow. Names are derived from filenames — `screens/inbox.tsx` becomes the `inbox` screen; `workflows/invoice-intake.ts` becomes the `invoice-intake` workflow.
+
+<Note>
+An App's files are limited to 200 files, 200 000 characters per file, and 1 000 000 characters in total. Paths may be at most 200 characters long.
+</Note>
+
+## Version model
+
+Code in an App moves through a four-stage lifecycle:
+
+<Steps>
+  <Step title="Draft">
+    The AI agent writes or edits files in a private draft tied to the current chat. Drafts are not committed — they exist only while the agent is working and are proposed as a single commit once the agent is done.
+  </Step>
+  <Step title="Commit (version N)">
+    A commit takes a set of file changes over the latest version and creates the next immutable version — version 1, 2, 3, and so on. Each commit triggers a build of the screens, server, and workflows so the version is ready to run immediately.
+  </Step>
+  <Step title="Pending review">
+    A builder may propose a version for review before making it current. Proposing flags it as the App's `pendingVersion` and produces a diff against the current version, listing changed files, screens, workflows, exports, and permission requests.
+  </Step>
+  <Step title="Current">
+    Making a version current replaces the running code. From that moment the App's server, screens, and workflows all run the new version. Workflows that require connections, collections, or another App's write exports ask an admin to grant those permissions again before they take effect.
+  </Step>
+</Steps>
+
+Versions are immutable once committed. A rollback is simply making an older version current again.
+
+## Creating an App
+
+Apps are created through the `session.apps` namespace of the Core RPC API:
+
+```ts
+const app = await session.apps.create({
+  name: "Invoice Intake",
+  description: "Receives invoices by email, extracts line items, and routes for approval",
+});
+```
+
+`create` takes a `NewApp` object — a `name` (required, up to 100 characters) and an optional `description` (up to 1 000 characters). It returns the new `App` record, which carries the App's `id`, `owner`, `currentVersion` (initially `null`), and `createdAt`.
+
+Once an App exists, you commit its first version by writing files:
+
+```ts
+const committed = await session.apps.files.commit(
+  app.id,
+  {
+    "app/server.ts": serverCode,
+    "screens/inbox.tsx": inboxCode,
+    "workflows/intake.ts": workflowCode,
+  },
+  "Initial version: email intake and inbox screen"
+);
+```
+
+The commit returns a `CommittedVersion` that includes build results for screens, server, and workflows, so you know immediately whether any file has a compile error.
+
+## The agent and Code Mode
+
+In practice, the AI agent in a chat writes App code on behalf of its builder. The agent works in a draft — a private workspace isolated per chat — and proposes a commit once it is confident the code is correct. It runs the builds and checks diagnostics, repairing errors before proposing, and opens a preview so the builder can confirm what the screens look like before the version is made current. A builder reviews the diff (the changed files, workflows, steps, and permission requests) and makes the version current when satisfied.
+
+## What's inside an App
+
+<CardGroup cols={2}>
+  <Card title="App Server" icon="server" href="/apps/server">
+    The Durable Object class in `app/server.ts`: stateful methods, live-update callbacks, and the sandbox it runs in.
+  </Card>
+  <Card title="App Screens" icon="browser" href="/apps/screens">
+    React components in `screens/*.tsx`: how they call the server, subscribe to live updates, and interact with workflows.
+  </Card>
+  <Card title="App Exports" icon="arrow-up-right" href="/apps/exports">
+    The `app/exports.json` manifest: declaring typed methods other Apps can call under a permission.
+  </Card>
+  <Card title="Workflow SDK" icon="bolt" href="/sdk/workflow">
+    The `@grasp-os/sdk` API all workflow code uses: steps, parameters, triggers, and bindings.
+  </Card>
+</CardGroup>

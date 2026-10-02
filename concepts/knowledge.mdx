@@ -1,0 +1,153 @@
+---
+title: "Knowledge: Versioned Markdown Documents and Collections"
+sidebarTitle: "Knowledge"
+description: "Versioned Markdown in access-controlled collections — full-text search, Grasp Skills, per-App AGENTS.md entries, and admin-only purge for data erasure."
+---
+
+The knowledge base is the organisation's long-term memory: Markdown documents with YAML frontmatter, organised into collections, versioned immutably. A save never overwrites an existing version — it always adds a new one and records which version it was edited from. This means two people editing the same document at once get a conflict rather than silently losing a change. The agent reads knowledge through a structured API (catalog, search, read, follow); people read and write through the UI. Every read of a document is recorded in the audit log.
+
+## Collections
+
+A **collection** is a named container for documents. Each collection has an access level and a source.
+
+### Access levels
+
+```typescript
+// packages/shared/src/knowledge.ts
+export const collectionAccessSchema = z.enum(["everyone", "teams", "me"]);
+```
+
+| Level | Who may read |
+|-------|-------------|
+| `everyone` | Every member of the organisation |
+| `teams` | Members of the teams listed on the collection |
+| `me` | Only the collection's owner |
+
+Shared collections (`everyone`, `teams`) may only be created by admins. A `teams` collection can be marked `sensitive`, which signals to the model gateway that data from it should be handled with extra care and may trigger restricted mode.
+
+### Collection sources
+
+```typescript
+// packages/shared/src/knowledge.ts
+export const collectionSourceSchema = z.enum(["here", "upload", "grasp", "apps"]);
+```
+
+| Source | Meaning |
+|--------|---------|
+| `here` | Documents written directly in the UI |
+| `upload` | Documents derived from uploaded files (text extracted by the platform) |
+| `grasp` | Grasp Skills — built-in knowledge shipped with each release, read-only for everyone |
+| `apps` | The Apps collection — one entry per App, read-only, platform-managed |
+
+The `grasp` and `apps` sources are **read-only** for people and agents. Only the platform writes them.
+
+<Note>
+  Every Grasp OS deployment runs in the EU, and all knowledge data is stored there. Collection and document IDs, access rules, and the search index are all EU-resident. The `jurisdiction("eu")` constraint is set when each Durable Object is created.
+</Note>
+
+## Document versioning
+
+Every save creates a new version. The schema for saving requires the version the document was edited from (`ifVersion`):
+
+```typescript
+// packages/shared/src/knowledge.ts
+export const saveInputSchema = z.strictObject({
+  collectionId: collectionIdSchema,
+  path: documentPathSchema,
+  text: z.string(),
+  /** 0 for a new document. */
+  ifVersion: z.int().min(0),
+  message: z.string().trim().max(500).optional(),
+});
+```
+
+If the document has moved past `ifVersion` since you read it, the save is refused with `knowledge.conflict`. The caller must reload the latest version and reapply their change. This is an optimistic-concurrency model: no locks, but no silent overwrites.
+
+Older versions are kept in full and accessible through the history API. A version can be restored by saving its text as a new version — not by overwriting in place.
+
+## Search
+
+The knowledge base exposes full-text search across all collections the requester may read, or within a single collection:
+
+```typescript
+// packages/shared/src/knowledge.ts
+export interface SearchHit {
+  documentId: DocumentId;
+  collectionId: CollectionId;
+  path: string;
+  title: string;
+  type: DocumentType;
+  description: string;
+  /** The section's place in its document, from 0. */
+  section: number;
+  headings: string[];
+  /** Plain text from the section, around what matched. */
+  snippet: string;
+}
+```
+
+Search returns matched **sections** (heading-delimited blocks), not whole documents, so long documents don't drown out precise matches. Results are ordered by relevance, best first. The query is plain text — no query syntax.
+
+## The agent's access to knowledge
+
+The agent accesses knowledge through three operations, each audited:
+
+<CardGroup cols={3}>
+  <Card title="catalog" icon="list">
+    Returns the collections the agent may read and their skills, sized to always fit in context. The catalog is never audited — it only names collections, not their content.
+  </Card>
+  <Card title="search + read" icon="magnifying-glass">
+    `search` finds matching sections. `read` fetches a whole document or a specific section by its position in the document. Both are audited.
+  </Card>
+  <Card title="follow" icon="arrow-right">
+    Returns a document's outbound `[[links]]`, backlinks, and (for skills) the files in its folder. Used to navigate the knowledge graph. Audited.
+  </Card>
+</CardGroup>
+
+```typescript
+// packages/shared/src/knowledge.ts
+export interface KnowledgeTools {
+  /** The readable collections and their skills, sized for always-on context. */
+  catalog: () => Promise<KnowledgeCatalog>;
+  /** Sections that match `query`, best first, with snippets. */
+  search: (query: string, options?: SearchOptions) => Promise<SearchResults>;
+  /** A document, or one section of it (a search hit's `section`). */
+  read: (documentId: string, options?: ReadOptions) => Promise<KnowledgeRead>;
+  /** A document's links and backlinks, and for a skill, its files. */
+  follow: (documentId: string) => Promise<FollowResult>;
+}
+```
+
+An App accesses a collection through a `CollectionReader` stub in `env`, bound by a permission an admin grants. The reader is scoped to that one collection and acts for the person the App or agent currently acts for.
+
+## Grasp Skills
+
+**Grasp Skills** are knowledge documents shipped as part of each platform release, stored in the `grasp` collection. They follow the [Agent Skills format](https://agentskills.dev): a `SKILL.md` entry point with frontmatter describing the skill, linking to supporting files in the same folder.
+
+Admins can copy a Grasp Skill into the client's own skills collection to customise it locally. A copied skill is a new document at the same path in the client's collection — independent of the original, editable by admins.
+
+## The Apps collection
+
+Every App in the registry has an entry in the **Apps collection** — a document at a path unique to that App, containing its `AGENTS.md`. This document is what the agent reads to understand what an App does and how to work with it.
+
+The Apps collection has `apps` source — it is read-only and managed entirely by the platform. An App's entry is visible only to users who may open that App (its owner, admins, and members it is shared with). A listing, read, or search never reveals one App's entry to someone who can't see that App.
+
+Each App's `AGENTS.md` file in its code tree is the canonical source. The Apps collection entry is regenerated from it whenever a new version becomes current.
+
+## Purge (admin-only data erasure)
+
+Admins can permanently erase personal data from the knowledge base. A purge is a two-step operation: **prepare**, which returns a plan and a confirmation token, then **confirm**, which executes it.
+
+Two kinds of purge exist:
+
+<Accordion title="Personal purge">
+  Deletes the person's Personal collection entirely — their `USER.md` and all its versions. Used during offboarding or on an erasure request.
+</Accordion>
+
+<Accordion title="Content purge">
+  Replaces every occurrence of specified terms (a name, an email address, a passage) across named documents, in every version. Each occurrence becomes `(removed)`. The plan includes `inLongerWords` — a count of places a term still starts a longer word in what the purge would leave, so the admin can add joined forms (like "TomVisser" for "Tom") as separate terms.
+</Accordion>
+
+<Warning>
+  A purge is permanent and irreversible. The audit log records who purged what and why, but **never what was removed**. The log itself cannot be purged. A purge of a document that an App's current version holds a term in is refused until the App is updated first — the Apps collection entry is derived from the App's code, so the App must change before the entry can be purged.
+</Warning>

@@ -1,0 +1,215 @@
+---
+title: "Grasp OS Audit Log: Architecture and Operations"
+sidebarTitle: "Audit Log"
+description: "How the hash-chained AuditLog Durable Object works, what it records, retention and archiving to R2, and how admins search, export, and verify it."
+---
+
+Every significant action in a Grasp OS deployment — sign-ins, model calls, connector calls, permission changes, App version activations, workflow run events, and platform updates — is written to an append-only, tamper-evident audit log. The log is not a flat table: each event is cryptographically linked to the one before it, forming a hash chain that can be verified from the first entry to the last, including events that have been archived to long-term storage.
+
+## The AuditLog Durable Object
+
+The audit log is a single [Durable Object](https://developers.cloudflare.com/durable-objects/) — `AuditLog` — per deployment, pinned to the EU jurisdiction through `jurisdiction("eu")`. It stores events in its built-in SQLite database (D1-backed storage), with one row per event. No other code writes to this database; the object is the sole authority for the chain.
+
+```typescript
+// From apps/core/wrangler.jsonc — the binding that core uses to reach it
+{ "name": "AUDIT_LOG", "class_name": "AuditLog" }
+
+// From apps/core/src/audit-log.ts — the single named instance per deployment
+export const auditLog = (env: AuditLogEnv): DurableObjectStub<AuditLog> =>
+  inJurisdiction(env, env.AUDIT_LOG).getByName("audit-log");
+```
+
+Events are collected in outboxes in `core` and `connect`, then flushed to the object every minute by `core`'s cron trigger. The object appends each batch atomically, skipping any event ID it already holds (idempotent delivery). A malformed or oversized event stops the whole batch — nothing from that batch is written.
+
+## Hash chain
+
+Each entry in the log is linked to the one before it by a cryptographic hash. The hash of entry _n_ covers:
+
+- The chain format version
+- The sequence number (`seq`)
+- The hash of entry _n − 1_ (`prevHash`)
+- The receipt time (`receivedAt`)
+- The event's canonical JSON (RFC 8785)
+
+Because each hash includes `prevHash`, inserting, deleting, or modifying any entry breaks the chain from that point forward. The chain can be verified one stretch at a time: call `verify(after)` to check from position `after`, pass the returned `through` as the next `after`, and repeat until `done` is `true`.
+
+```typescript
+// From packages/shared/src/audit-log.ts
+export type ChainVerification =
+  | {
+      ok: true;
+      through: number;
+      head: string;
+      done: boolean;
+      purged?: true; // stretch was legitimately purged by retention
+    }
+  | { ok: false; brokenAt: number; reason: ChainBreak };
+
+export type FullVerification = {
+  startedAt: string;
+  finishedAt: string;
+  purgedThrough?: number;
+} & (
+  | { ok: true; through: number; head: string }
+  | { ok: false; brokenAt: number; reason: ChainBreak }
+);
+```
+
+The object records each completed pass (`lastFullVerification`), so admins can see when the chain was last fully checked and whether it passed.
+
+## The AuditRecord fields
+
+Every record returned by a search or export carries the full chain metadata alongside the event:
+
+| Field | Description |
+|---|---|
+| `seq` | Position in the chain, from 1 |
+| `receivedAt` | When the log received it (ISO 8601, set by the log) |
+| `eventJson` | The event byte-for-byte as stored and hashed (canonical JSON) |
+| `event` | The parsed event, read with today's schema; `null` if the stored bytes aren't a valid event |
+| `type` | The event's type (`read`, `action`, `decision`, `permission`, `model_call`, `config`, `platform_update`), or `null` |
+| `version` | The hash format version |
+| `prevHash` | Hash of the preceding entry |
+| `hash` | This entry's hash |
+| `verified` | Whether the event parses, its hash matches `eventJson` and its chain fields, and it links to the entry before it |
+
+<Note>
+`eventJson` is what the hash covers. Anyone with the log's canonical JSON and the hash algorithm can recompute the hash independently and compare it against the live chain.
+</Note>
+
+## What is audited
+
+The audit log captures events across every layer of the platform. Actions are `noun.verbed` in dotted segments, with the most general segment first.
+
+<Accordion title="Authentication and sessions">
+- Sign-in and sign-out (`auth.*`)
+- Staff sign-in to a deployment (`staff.session`)
+- Session creation and expiry
+</Accordion>
+
+<Accordion title="Model calls">
+- Every model call through the model gateway (`model.*`), including the prompt hash (not the prompt content) and token counts
+- Spending budget alerts and exhaustion (`model.budget`)
+</Accordion>
+
+<Accordion title="Connector calls">
+- Every connector call through connect (`connection.call`), including the action name, resource identifier, idempotency key, and whether it had a side effect
+- Connection lifecycle: connect, reconnect, disconnect, consent changes, reauth needed (`connection.connect`, `connection.reconnected`, `connection.disconnect`, `connection.consent`, `connection.needs_reauth`)
+- Event trigger activity: reads, dropped events, listener start/stop (`connection.events.*`)
+- Held actions: dropped, confirmed, or declined (`connection.action.*`)
+</Accordion>
+
+<Accordion title="Permissions">
+- Every permission grant and revoke (`permission.*`)
+- Restricted-context events: when a chat or run reads restricted sources and is held to them (`context.restricted`)
+- Guest invitations and revocations (`guest.invited`, `guest.revoked`)
+</Accordion>
+
+<Accordion title="App versions">
+- App creation, version activation, version tests (`app.*`)
+- App-to-App calls, as both the calling App and the called App record them (`app.call`, `app.called`)
+</Accordion>
+
+<Accordion title="Workflow runs">
+- Run started, step completed, step failed (`workflow.run.*`, `workflow.step.*`)
+- Decisions opened, answered, timed out (`workflow.decision.*`)
+- Schedule events and stopped schedules (`workflow.schedule.*`)
+- Inbound email attachments read during a run (`workflow.email.read`)
+</Accordion>
+
+<Accordion title="Knowledge">
+- Searches and document reads (`knowledge.search`, `knowledge.read`)
+- Collection configuration changes (`knowledge.collection`)
+- Usage signals computed and read (`knowledge.signals.*`)
+</Accordion>
+
+<Accordion title="Platform updates">
+- Every platform release deployed to a client (`platform.*`) — recorded once per version by the cron trigger
+- Audit log retention events (`audit.archived`, `audit.purged`)
+</Accordion>
+
+## What is NOT logged
+
+The audit log is designed to be safe to retain and inspect without exposing sensitive data.
+
+<Warning>
+The following are deliberately excluded from audit events:
+- Sensitive parameter values passed to connector tools
+- Message bodies and chat content
+- File contents (only access events are logged, not the files themselves)
+- Prompt text (only the prompt hash is logged for model calls)
+- Headers and request bodies (never logged at the platform level; `invocation_logs: false` in `wrangler.jsonc`)
+- OAuth tokens (never leave the connect Worker)
+</Warning>
+
+## Retention and archiving
+
+Retention is controlled by two deployment-level variables set by the console.
+
+<Tabs>
+  <Tab title="Searchable retention">
+    `AUDIT_RETENTION_DAYS` controls how long events stay in the searchable log inside the Durable Object. Default is **180 days**; minimum is **30 days** (so admins always have at least the last month); maximum is ten years.
+
+    A value outside that range, or one that isn't a whole number of days, is logged as `config.invalid` and nothing is archived: events stay searchable until the configuration is fixed.
+
+    This is deployment configuration (set by the console, not an in-product setting), so a compromised admin session cannot shorten it.
+  </Tab>
+  <Tab title="Archive retention">
+    `AUDIT_ARCHIVE_RETENTION_DAYS` controls the total age (from receipt) before an event is purged from the archive in R2. It must be at least 365 days and at least `AUDIT_RETENTION_DAYS`. While it is unset, archived events are never purged.
+
+    ```jsonc
+    // From apps/core/wrangler.jsonc
+    {
+      "binding": "AUDIT_ARCHIVE",
+      "bucket_name": "grasp-os-audit-archive",
+      "jurisdiction": "eu"  // archive stays in the EU
+    }
+    ```
+  </Tab>
+</Tabs>
+
+The retention alarm runs daily on the Durable Object itself. It archives expired events — oldest first, up to `archiveStretch` (500) entries at a time — writes each stretch to the `AUDIT_ARCHIVE` R2 bucket as newline-delimited JSON, records the stretch in the chain (`audit.archived`), and deletes the entries from the live database in one transaction. The chain carries on across archived stretches: archived events still count during verification.
+
+<Info>
+An event is archived at most one day past its retention deadline — the alarm fires daily, not per-event. The chain is only archived when it verifies: a break stays in place where it can be found.
+</Info>
+
+## Admin operations
+
+The audit API (`AuditApi`) is available to admins over `/rpc`. Every search that returns records, every first page, every export, and every verification that finishes or finds a break is itself recorded in the log.
+
+<CardGroup cols={2}>
+  <Card title="Search" icon="magnifying-glass">
+    Filter by actor (type or ID), action prefix, event type, target, resource, and time range. Results are paginated, newest first. The log scans at most 5,000 entries per call to bound cost regardless of how selective the filter is.
+  </Card>
+  <Card title="Export" icon="file-export">
+    Export all matching events as JSON or CSV. JSON includes `exportedAt`, `filter`, the chain head, all records with their chain metadata, a per-record verification result, and `lastFullVerification`. CSV adds `'` prefix to cells that would be read as formulas. Stops at 100,000 records (`auditExportMaxRecords`).
+  </Card>
+  <Card title="Chain verification" icon="link">
+    `ChainVerification`: one step, checking up to 500 entries or one archived stretch. Pass `through` as the next `after` until `done`. Archived stretches are checked against their R2 objects; purged stretches are reported as `purged: true`.
+  </Card>
+  <Card title="Full verification" icon="shield-check">
+    `FullVerification`: the result of the last complete pass from position 0 to the head, recorded by the object. Shows `startedAt`, `finishedAt`, and whether the whole chain passed.
+  </Card>
+</CardGroup>
+
+### Filter fields
+
+```typescript
+// From packages/shared/src/audit-log.ts — AuditFilter
+{
+  from?: string;       // ISO 8601 — inclusive lower bound on receivedAt
+  to?: string;         // ISO 8601 — exclusive upper bound on receivedAt
+  actorType?: "person" | "agent" | "app" | "workflow" | "staff" | "guest" | "system";
+  actorId?: string;    // userId, agentId, appId, or runId
+  type?: "read" | "action" | "decision" | "permission" | "model_call" | "config" | "platform_update";
+  action?: string;     // action or dotted prefix: "connection" finds "connection.call"
+  targetType?: string;
+  targetId?: string;
+  resource?: string;   // a resource named in provenance or detail.resource
+}
+```
+
+### Export download
+
+Exports are also available as a direct browser download from `GET /api/audit/export` with `format` (`json` or `csv`) and filter fields as query parameters, authenticated by the admin's session cookie.

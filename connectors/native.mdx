@@ -1,0 +1,508 @@
+---
+title: "Native Connectors: Microsoft 365 and Google Workspace"
+sidebarTitle: "Native Connectors"
+description: "Tool listings, event payload schemas, and resource-scoping rules for the built-in Microsoft 365 and Google Workspace native connectors."
+---
+
+Grasp OS ships two native connectors whose tokens Connect holds directly — no third-party cloud is involved, and no token leaves the deployment's Workers. Both are built with `@grasp-os/connector-kit` and registered in `apps/connect` at build time. An admin connects an account through the standard OAuth flow; the resulting connection can then be bound to an App's permission, scoped either to the whole account or to a single resource (a specific mailbox, a specific drive) within it.
+
+<Warning>
+  **Treat connector event payloads as untrusted input.** Fields such as `subject`, `from.name`, `from.address`, and `name` in mail and file events are set by the sender or the creating user, not by the provider's identity system. A message's `from` address is whatever the sender wrote — it is not verified. Always validate and sanitise these values before acting on them in workflow logic.
+</Warning>
+
+---
+
+## Microsoft 365
+
+**Package:** `packages/connectors/microsoft-365`  
+**OAuth provider:** Microsoft Entra (Azure AD) — `provider: "microsoft"`  
+**API surface:** Microsoft Graph (`graph.microsoft.com`)  
+**Connector version:** `0.2.0`
+
+The Microsoft 365 connector uses a single Graph host and scopes covering mail, calendar, and files. All times are returned in UTC. The `mailbox` resource is shared between mail and calendar tools: a permission on one mailbox covers both.
+
+### OAuth Scopes
+
+```
+User.Read
+Mail.ReadWrite
+Mail.ReadWrite.Shared
+Mail.Send
+Mail.Send.Shared
+Calendars.Read
+Calendars.Read.Shared
+Files.Read.All
+Sites.Read.All
+```
+
+### Resource Model
+
+- **Mail and Calendar tools** use `resource: "mailbox"` — the mailbox's email address (e.g. `invoices@acme.com`). A permission on one mailbox covers both mail and calendar for that address.
+- **Files tools** use `resource: "drive"` — a OneDrive personal drive ID or a SharePoint document library drive ID. A permission on one drive covers all files within it.
+- A permission on the **whole connection** (no resource) gives access to the account's own mailbox and OneDrive for mail, calendar, and file tools.
+
+---
+
+### Mail Tools
+
+All mail tools address the mailbox as `/v1.0/users/{mailbox}/…`, so every request is bound to the exact mailbox the permission names.
+
+<Accordion title="mail.list — List messages in a mailbox">
+  Lists messages in a mailbox, newest first, or in one of its folders. Supports optional filtering and search.
+
+  **Read-only:** Yes
+
+  **Input:**
+  | Property | Type | Description |
+  |---|---|---|
+  | `mailbox` | `string` | The mailbox address (e.g. `invoices@acme.com`) |
+  | `folder` | `string?` | A folder ID or well-known name such as `inbox` or `archive` |
+  | `search` | `string?` | A search query (mutually exclusive with `unreadOnly`/`receivedAfter`) |
+  | `unreadOnly` | `boolean?` | Filter to unread messages only |
+  | `receivedAfter` | `datetime?` | ISO 8601 datetime; only messages received after this time |
+  | `top` | `number?` | How many to return (default 25) |
+  | `page` | `string?` | Pagination cursor from a previous response's `nextPage` |
+
+  **Output:** `{ mailbox, messages: MessageSummary[], nextPage: string | null }`
+</Accordion>
+
+<Accordion title="mail.get — Get one message with body and attachments">
+  Fetches a single message with its full body and a list of attachments (names, types, sizes — not content). `moreAttachments` is `true` when the message has more attachments than are listed.
+
+  **Read-only:** Yes
+
+  **Input:** `{ mailbox, message: string, bodyType?: "text" | "html" }`
+
+  **Output:** Full message object including `body`, `bcc`, `replyTo`, `attachments`, `moreAttachments`
+</Accordion>
+
+<Accordion title="mail.readAttachment — Read a file attachment">
+  Reads one file attachment of a message, up to 4 MiB, as text or base64.
+
+  **Read-only:** Yes
+
+  **Input:** `{ mailbox, message: string, attachment: string, as?: "text" | "base64" }`
+
+  **Output:** `{ mailbox, messageId, id, name, contentType, size, encoding, content }`
+</Accordion>
+
+<Accordion title="mail.send — Send a message">
+  Sends a message from a mailbox (the account's own or a shared one), saving a copy in Sent Items.
+
+  **Read-only:** No · **Destructive:** No
+
+  **Input:** `{ mailbox, subject, body, bodyType?, to, cc?, bcc?, replyTo? }`
+
+  **Output:** `{ mailbox, sent: true }`
+
+  **Confirmation fields shown:** From, To, Cc, Bcc, Reply to, Subject, Body, Body format
+</Accordion>
+
+<Accordion title="mail.createDraft — Create a draft message">
+  Creates a draft in the Drafts folder for a person to review and send manually.
+
+  **Read-only:** No · **Destructive:** No
+
+  **Input:** `{ mailbox, subject, body, bodyType?, to, cc?, bcc?, replyTo? }`
+
+  **Output:** `{ mailbox, id, conversationId, webLink }`
+</Accordion>
+
+<Accordion title="mail.move — Move a message to another folder">
+  Moves a message to a different folder. The moved message gets a new ID.
+
+  **Read-only:** No · **Destructive:** Yes
+
+  **Input:** `{ mailbox, message: string, destination: string }` (destination is a folder ID or well-known name)
+
+  **Output:** `{ mailbox, previousId, id, folderId }`
+
+  **Confirmation fields shown:** Mailbox, Message, To folder
+</Accordion>
+
+---
+
+### Files Tools (OneDrive / SharePoint)
+
+All file tools use `resource: "drive"` and address files via drive IDs (`/v1.0/drives/{drive}/…`).
+
+<Accordion title="files.list — List files and folders">
+  Lists files and folders at the drive's root or in a specific folder.
+
+  **Read-only:** Yes
+
+  **Input:** `{ drive, folder?: string, top?, page? }`
+
+  **Output:** `{ drive, items: Item[], nextPage }`
+
+  Each item includes `id`, `name`, `kind` (`"file"`, `"folder"`, or `"other"`), `mimeType`, `size`, `parentId`, `lastModifiedAt`, `webUrl`.
+</Accordion>
+
+<Accordion title="files.search — Search files by name and content">
+  Full-text search across the drive.
+
+  **Read-only:** Yes
+
+  **Input:** `{ drive, query: string, top?, page? }`
+
+  **Output:** `{ drive, items: Item[], nextPage }`
+</Accordion>
+
+<Accordion title="files.read — Read a file's content">
+  Downloads a file's content (up to 4 MiB) as text or base64. Graph answers with a redirect to SharePoint; Connect's egress follows it without the token.
+
+  **Read-only:** Yes
+
+  **Input:** `{ drive, item: string, as?: "text" | "base64" }`
+
+  **Output:** `{ drive, id, name, mimeType, size, encoding, content }`
+</Accordion>
+
+---
+
+### Calendar Tools
+
+Calendar tools share the `mailbox` resource with mail tools.
+
+<Accordion title="calendar.list — List calendar events">
+  Lists events in a time range, recurring events expanded to individual occurrences, earliest first.
+
+  **Read-only:** Yes
+
+  **Input:** `{ mailbox, start: datetime, end: datetime, top?, page? }`
+
+  **Output:** `{ mailbox, events: EventSummary[], nextPage }` — times in UTC
+</Accordion>
+
+<Accordion title="calendar.get — Get one calendar event">
+  Fetches a single event with its body, attendee list, and online meeting join URL.
+
+  **Read-only:** Yes
+
+  **Input:** `{ mailbox, event: string }`
+
+  **Output:** Full event including `body`, `attendees` (with `type` and `response`), `joinUrl`
+</Accordion>
+
+---
+
+### Connector Events
+
+Connect polls Microsoft Graph's change-notification subscriptions and delivers events within approximately one minute of the triggering action.
+
+#### `m365.mail.received`
+
+Fires when mail arrives in a mailbox's inbox. A message moved into the inbox later is also reported (unlike Google's equivalent).
+
+**Read action required:** `mail.list`
+
+| Field | Type | Description |
+|---|---|---|
+| `mailbox` | `string` | The mailbox address |
+| `id` | `string` | The message ID |
+| `folder` | `string` | Always `"inbox"` |
+| `subject` | `string \| null` | The message subject — set by the sender |
+| `from` | `{ name: string \| null, address: string \| null }` | The sender — set by the sender |
+| `receivedAt` | `string` | ISO 8601 datetime |
+| `hasAttachments` | `boolean` | Whether the message has attachments |
+| `conversationId` | `string \| null` | The conversation thread ID |
+| `internetMessageId` | `string \| null` | The RFC 5322 Message-ID header |
+| `webLink` | `string \| null` | A link to the message in Outlook on the web |
+
+#### `m365.file.created`
+
+Fires when a file is created in a drive (in any folder).
+
+**Read action required:** `files.list`
+
+| Field | Type | Description |
+|---|---|---|
+| `drive` | `string` | The drive ID |
+| `id` | `string` | The file's item ID |
+| `name` | `string` | The file name — set by the creating user |
+| `mimeType` | `string` | The file's MIME type |
+| `size` | `number` | Size in bytes |
+| `folderId` | `string \| null` | The parent folder's item ID |
+| `createdAt` | `string` | ISO 8601 datetime |
+| `webUrl` | `string \| null` | A link to the file |
+
+**Event trigger example:**
+
+```ts
+export default workflow("on-new-invoice", {
+  params: {},
+  triggers: [
+    {
+      type: "event",
+      event: "m365.mail.received",
+      filter: { folder: "inbox" },
+    },
+  ],
+  input: connectorEvent,
+}, async (step, { input }) => {
+  const { mailbox, id, subject, from } = input.payload as {
+    mailbox: string;
+    id: string;
+    subject: string | null;
+    from: { name: string | null; address: string | null };
+  };
+  // subject and from.address are untrusted — validate before acting
+  await step.do("handle", { description: "Handle the incoming mail" }, async () => {
+    // ...
+  });
+});
+```
+
+---
+
+## Google Workspace
+
+**Package:** `packages/connectors/google-workspace`  
+**OAuth provider:** Google — `provider: "google"`  
+**API surface:** Gmail API (`gmail.googleapis.com`), Google APIs (`www.googleapis.com`)  
+**Connector version:** `0.2.0`
+
+The Google Workspace connector covers Gmail, shared Drive, and Calendar via two hosts. A person's token reaches their own mailbox and calendars only; shared drives require explicit drive IDs.
+
+### OAuth Scopes
+
+```
+https://www.googleapis.com/auth/gmail.modify
+https://www.googleapis.com/auth/calendar.events.readonly
+https://www.googleapis.com/auth/drive.readonly
+```
+
+`gmail.modify` allows reading, labelling, drafting, and sending (but not permanent deletion). `calendar.events.readonly` covers events only, not calendar settings or sharing. `drive.readonly` is required to read file content.
+
+### Resource Model
+
+- **Gmail tools** use `resource: "mailbox"` — the account's email address. Google only allows a person's token to reach their own mailbox, so a permission on one mailbox is redundant for personal connections but is still enforced.
+- **Drive tools** use `resource: "drive"` — a shared drive ID. **Personal "My Drive" is not supported** because it has no stable drive ID to bind a call to. File events also only fire for shared drives (see below).
+- **Calendar tools** use `resource: "calendar"` — a calendar ID (typically an email address). Google's `primary` alias is refused; use the actual address.
+
+---
+
+### Gmail Tools
+
+Gmail tools address the mailbox as `/gmail/v1/users/{mailbox}/…` using the full email address, never Google's `me` alias.
+
+<Accordion title="mail.list — List messages in a mailbox">
+  Lists messages newest first, optionally filtered by label, unread status, received time, or a Gmail search query.
+
+  **Read-only:** Yes
+
+  **Input:**
+  | Property | Type | Description |
+  |---|---|---|
+  | `mailbox` | `string` | The mailbox email address |
+  | `label` | `string?` | A label ID from `mail.labels`, or a system label like `INBOX` |
+  | `search` | `string?` | A Gmail search query |
+  | `unreadOnly` | `boolean?` | Only unread messages |
+  | `receivedAfter` | `datetime?` | ISO 8601 datetime |
+  | `top` | `number?` | How many to return (default 10) |
+  | `page` | `string?` | Pagination cursor |
+
+  **Output:** `{ mailbox, messages: MessageSummary[], nextPage }`
+</Accordion>
+
+<Accordion title="mail.get — Get one message with body and attachments">
+  Fetches a single message with its full body (text or HTML part) and attachment metadata. The body is `null` when the message has no text or HTML part.
+
+  **Read-only:** Yes
+
+  **Input:** `{ mailbox, message: string, bodyType?: "text" | "html" }`
+
+  **Output:** Full message including `body`, `bcc`, `replyTo`, `attachments`
+</Accordion>
+
+<Accordion title="mail.readAttachment — Read an attachment">
+  Reads one attachment (by its part ID from `mail.get`), up to 4 MiB, as text or base64.
+
+  **Read-only:** Yes
+
+  **Input:** `{ mailbox, message: string, attachment: string, as?: "text" | "base64" }`
+
+  **Output:** `{ mailbox, messageId, id, name, contentType, size, encoding, content }`
+</Accordion>
+
+<Accordion title="mail.labels — List mailbox labels">
+  Lists all labels in a mailbox — system labels (`INBOX`, `UNREAD`) and user-defined ones — with the IDs that `mail.list` and `mail.label` accept.
+
+  **Read-only:** Yes
+
+  **Input:** `{ mailbox }`
+
+  **Output:** `{ mailbox, labels: { id, name, type }[] }`
+</Accordion>
+
+<Accordion title="mail.label — Add or remove labels">
+  Adds and removes labels on a message in a single call. Use this to mark a message read (remove `UNREAD`), move it (add a label, remove `INBOX`), or mark it as spam (add `SPAM`).
+
+  **Read-only:** No · **Destructive:** Yes
+
+  **Input:** `{ mailbox, message: string, add?: string[], remove?: string[] }`
+
+  **Output:** `{ mailbox, id, labelIds }`
+
+  **Confirmation fields:** Mailbox, Message, Add labels, Remove labels
+</Accordion>
+
+<Accordion title="mail.send — Send a message">
+  Sends a message from the mailbox, saving a copy in the Sent label.
+
+  **Read-only:** No · **Destructive:** No
+
+  **Input:** `{ mailbox, subject, body, bodyType?, to, cc?, bcc?, replyTo? }`
+
+  **Output:** `{ mailbox, sent: true, id, threadId }`
+
+  **Confirmation fields:** From, To, Cc, Bcc, Reply to, Subject, Body, Body format
+</Accordion>
+
+<Accordion title="mail.createDraft — Create a draft message">
+  Creates a draft in the mailbox for a person to review and send manually.
+
+  **Read-only:** No · **Destructive:** No
+
+  **Input:** `{ mailbox, subject, body, bodyType?, to, cc?, bcc?, replyTo? }`
+
+  **Output:** `{ mailbox, id, messageId, threadId }`
+</Accordion>
+
+---
+
+### Drive Tools (Shared Drives Only)
+
+<Accordion title="files.list — List files and folders in a shared drive">
+  Lists files and folders at the drive's root or in a specific folder.
+
+  **Read-only:** Yes
+
+  **Input:** `{ drive, folder?: string, top?, page? }`
+
+  **Output:** `{ drive, items: Item[], nextPage }` — items include `kind`, `mimeType`, `size`, `parentId`, `lastModifiedAt`, `webUrl`
+</Accordion>
+
+<Accordion title="files.search — Search a shared drive">
+  Full-text search (name and content) across a shared drive, most relevant first.
+
+  **Read-only:** Yes
+
+  **Input:** `{ drive, query: string, top?, page? }`
+
+  **Output:** `{ drive, items: Item[], nextPage }`
+</Accordion>
+
+<Accordion title="files.read — Read a file's content">
+  Downloads a file's content (up to 4 MiB) as text or base64. Google Docs and Slides are exported as plain text; Sheets are exported as CSV (first sheet only). The tool verifies the file belongs to the bound drive before fetching content.
+
+  **Read-only:** Yes
+
+  **Input:** `{ drive, item: string, as?: "text" | "base64" }`
+
+  **Output:** `{ drive, id, name, mimeType, contentType, size, encoding, content }`
+</Accordion>
+
+---
+
+### Calendar Tools
+
+Calendar IDs for Google are email-format addresses; the special `primary` alias is rejected. A calendar ID containing `#` (national holidays, birthdays) is also rejected, as `#` cannot appear safely in a path parameter.
+
+<Accordion title="calendar.list — List calendar events">
+  Lists events in a time range, recurring events expanded to occurrences, earliest first, in UTC.
+
+  **Read-only:** Yes
+
+  **Input:** `{ calendar, start: datetime, end: datetime, top?, page? }`
+
+  **Output:** `{ calendar, events: EventSummary[], nextPage }`
+</Accordion>
+
+<Accordion title="calendar.get — Get one calendar event">
+  Fetches a single event with its description, attendees (with response status), and Google Meet join URL.
+
+  **Read-only:** Yes
+
+  **Input:** `{ calendar, event: string }`
+
+  **Output:** Full event including `body`, `attendees` (with `response`, `optional`), `joinUrl`
+</Accordion>
+
+---
+
+### Connector Events
+
+Connect uses Gmail push notifications and Drive change tokens to detect new mail and files, delivering events within approximately one minute.
+
+#### `google.mail.received`
+
+Fires when mail **arrives** in a mailbox's inbox. Unlike `m365.mail.received`, a message that is moved into the inbox after arrival is **not** reported.
+
+**Read action required:** `mail.list`
+
+| Field | Type | Description |
+|---|---|---|
+| `mailbox` | `string` | The mailbox address |
+| `id` | `string` | The Gmail message ID |
+| `threadId` | `string` | The Gmail thread ID |
+| `folder` | `string` | Always `"inbox"` |
+| `subject` | `string \| null` | The message subject — set by the sender |
+| `from` | `{ name: string \| null, address: string \| null }` | The sender — set by the sender |
+| `receivedAt` | `string` | ISO 8601 datetime |
+
+#### `google.file.created`
+
+Fires when a file is created in a **shared drive**. Personal My Drive is not covered — Connect cannot bind file event subscriptions to a drive without a stable drive ID.
+
+**Read action required:** `files.list`
+
+| Field | Type | Description |
+|---|---|---|
+| `drive` | `string` | The shared drive ID |
+| `id` | `string` | The file ID |
+| `name` | `string` | The file name — set by the creating user |
+| `mimeType` | `string` | The file's MIME type |
+| `size` | `number` | Size in bytes |
+| `folderId` | `string \| null` | The parent folder ID |
+| `createdAt` | `string` | ISO 8601 datetime |
+| `webUrl` | `string \| null` | A link to the file |
+
+<Warning>
+  `google.file.created` fires only for **shared drives**, not for a user's personal My Drive. A permission scoped to the whole Google Workspace connection does not generate file events. To receive file events, the permission (and the trigger's connection binding) must be scoped to a specific shared drive ID.
+</Warning>
+
+**Event trigger example:**
+
+```ts
+export default workflow("on-drive-upload", {
+  params: {},
+  triggers: [{ type: "event", event: "google.file.created" }],
+  input: connectorEvent,
+}, async (step, { input }) => {
+  const { drive, id, name, mimeType } = input.payload as {
+    drive: string;
+    id: string;
+    name: string;  // set by the uploading user — treat as untrusted
+    mimeType: string;
+  };
+  await step.do("process-file", { description: "Process the uploaded file" }, async () => {
+    // ...
+  });
+});
+```
+
+---
+
+## Comparison
+
+| Feature | Microsoft 365 | Google Workspace |
+|---|---|---|
+| Mail tools | `mail.list`, `mail.get`, `mail.readAttachment`, `mail.send`, `mail.createDraft`, `mail.move` | `mail.list`, `mail.get`, `mail.readAttachment`, `mail.labels`, `mail.label`, `mail.send`, `mail.createDraft` |
+| Files tools | `files.list`, `files.search`, `files.read` | `files.list`, `files.search`, `files.read` |
+| Calendar tools | `calendar.list`, `calendar.get` | `calendar.list`, `calendar.get` |
+| Mail event | `m365.mail.received` (includes moved-in) | `google.mail.received` (arrived only) |
+| File event | `m365.file.created` (OneDrive + SharePoint) | `google.file.created` (shared drives only) |
+| Personal drive file events | ✅ | ❌ |
+| Shared mailboxes | ✅ (`Mail.ReadWrite.Shared`) | ❌ |
+| Calendar resource scope | Same as mailbox | Separate calendar ID |

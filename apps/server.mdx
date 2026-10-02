@@ -1,0 +1,170 @@
+---
+title: "App Server: Stateful Durable Object Backend"
+sidebarTitle: "Server"
+description: "The App server runs as a Cloudflare Durable Object with its own SQLite database, serving every user and workflow that calls the App at the same time."
+---
+
+Every App has a single server class defined in `app/server.ts`. It extends Cloudflare's `DurableObject` and acts as the App's stateful core: it owns the App's SQLite database, it handles calls from screens and workflows, and it pushes live updates to every open screen through a callback pattern called Watchers. One instance runs per App — all users of the same App share it, concurrently.
+
+## The server class
+
+The class must be exported as `App` from `app/server.ts`. It extends `DurableObject` from `cloudflare:workers`, which gives it access to `this.ctx.storage` — a SQLite database that persists across code deployments and object restarts.
+
+```ts
+import { DurableObject } from "cloudflare:workers";
+
+type Caller = { userId: string; mode: "interactive" | "workflow"; token: string };
+
+export class App extends DurableObject {
+  notes(): string[] {
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS notes (note TEXT)");
+    return this.ctx.storage.sql
+      .exec("SELECT note FROM notes")
+      .toArray()
+      .map((row) => String(row.note));
+  }
+
+  addNote(caller: Caller, note: string): void {
+    this.notes();
+    this.ctx.storage.sql.exec("INSERT INTO notes VALUES (?)", note);
+  }
+}
+```
+
+<Info>
+The App's SQLite database is not wiped when a new version is made current. Schema migrations are the App's responsibility — use `CREATE TABLE IF NOT EXISTS` and `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` guards.
+</Info>
+
+## Method naming rules
+
+Core calls only methods whose names satisfy all of these conditions, checked against `appMethodPattern`:
+
+- **Start with a lowercase letter** (`a`–`z`)
+- **Contain only letters and digits** after the first character
+- **Be at most 64 characters** long
+- **Not be a reserved name** — the full list is in `reservedAppMethods` from `@grasp-os/shared/apps`:
+
+<Accordion title="Reserved method names (core never calls these)">
+`alarm`, `connect`, `constructor`, `delete`, `dup`, `fetch`, `get`, `hasOwnProperty`, `id`, `isPrototypeOf`, `name`, `propertyIsEnumerable`, `put`, `queue`, `scheduled`, `then`, `toLocaleString`, `toString`, `valueOf`, `webSocketClose`, `webSocketError`, `webSocketMessage`
+</Accordion>
+
+Any method whose name doesn't match these rules is invisible to core — calling it returns `app.method_invalid`. Names like `set_status` (contains `_`) or `GetInvoice` (starts uppercase) are never called.
+
+## The Caller type
+
+Core passes the **caller** as the first argument of every method it invokes. The caller identifies who is acting — a person using a screen or a workflow run — and carries a short-lived token that authorises the call to use the App's connections and other permissions.
+
+```ts
+interface Caller {
+  userId: string;
+  /** "interactive" for a screen user; "workflow" for a run. */
+  mode: "interactive" | "workflow";
+  /** Valid only for the duration of this one call. */
+  token: string;
+  /** For a workflow step: that step's idempotency key. */
+  idempotencyKey?: string;
+  /** For a call from another App's export: that App's ID and version. */
+  app?: { id: string; version: number };
+}
+```
+
+App code passes the caller on to its connection stubs — `env.OUTLOOK.call(caller, action, input)` — so every external call is audited under the person the App acts for. A method that doesn't interact with connections can ignore the caller, but it must still accept it as the first parameter.
+
+<Warning>
+Never store a caller across method calls. A token is valid only for the duration of the single call it came with; any call made after that call ends will fail with `app.caller_invalid`.
+</Warning>
+
+## The Watcher pattern for live updates
+
+A method that receives a **Watcher callback** as its last argument can push updates to every open screen in real time. The callback is an RPC stub: calling it sends a value to the screen that subscribed, and calling it after the screen is gone throws — which is the signal to drop it.
+
+The convention is:
+
+1. Call `onChange.dup()` to get a duplicate the App owns (the original ends with the call).
+2. Store the duplicate in a `Set`.
+3. Call it immediately with the current value.
+4. Call all stored watchers whenever the data changes.
+5. Remove any watcher whose call throws (the screen is gone).
+
+```ts
+import { DurableObject } from "cloudflare:workers";
+
+type Caller = { userId: string; mode: "interactive" | "workflow"; token: string };
+type Watcher = ((notes: string[]) => Promise<void>) & Disposable & { dup(): Watcher };
+
+export class App extends DurableObject {
+  #watchers = new Set<Watcher>();
+
+  watchNotes(_caller: Caller, onChange: Watcher): void {
+    const watcher = onChange.dup();
+    this.#watchers.add(watcher);
+    void this.#send(watcher, this.#notes());
+  }
+
+  addNote(_caller: Caller, note: string): void {
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS notes (note TEXT)");
+    this.ctx.storage.sql.exec("INSERT INTO notes VALUES (?)", note);
+    for (const watcher of this.#watchers) {
+      void this.#send(watcher, this.#notes());
+    }
+  }
+
+  #notes(): string[] {
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS notes (note TEXT)");
+    return this.ctx.storage.sql
+      .exec("SELECT note FROM notes")
+      .toArray()
+      .map((row) => String(row.note));
+  }
+
+  async #send(watcher: Watcher, notes: string[]): Promise<void> {
+    try {
+      await watcher(notes);
+    } catch {
+      this.#watchers.delete(watcher);
+      watcher[Symbol.dispose]();
+    }
+  }
+}
+```
+
+On the screen side, `useLive("watchNotes", [])` from `@grasp-os/sdk/screen` subscribes automatically and re-subscribes if the connection drops. See [App Screens](/apps/screens) for the full screen API.
+
+<Tip>
+Values passed to a Watcher callback must be plain, structured-cloneable data — no class instances, no functions, no RPC stubs. Core rejects answers that don't survive `structuredClone` with `app.answer_invalid`.
+</Tip>
+
+## Calling server methods from workflows
+
+Workflows call the App's own server through `appServer<App>(env)` from `@grasp-os/sdk/workflow`. It returns a typed stub that mirrors the server class, without the leading `caller` argument (core passes that automatically):
+
+```ts
+import type { App } from "../app/server.ts";
+import { appServer, workflow } from "@grasp-os/sdk/workflow";
+
+export default workflow("file-note", { params: {} }, async (step, { env }) => {
+  await step.do(
+    "add",
+    { description: "Add a note", sideEffect: true, input: { text: "Filed" } },
+    async ({ input }) => {
+      await appServer<App>(env).addNote(input.text);
+    }
+  );
+});
+```
+
+`appServer` only works inside a step's function — core refuses calls made between steps or from inside another step. The same applies to `appExports` for other Apps' exports.
+
+## The sandbox
+
+The App's server code runs in a **hardened isolate** that is separate from the core Worker:
+
+| Constraint | Detail |
+|---|---|
+| **No outbound network** | `globalOutbound: null` — the App cannot make HTTP calls directly |
+| **No core env bindings** | The isolate's env holds only stubs for the App's active permissions, never core's own bindings |
+| **Caller token per call** | Each method call gets a fresh token valid only for that call |
+| **60-second timeout** | A call that doesn't complete within 60 seconds is terminated; the caller receives `app.timed_out` |
+| **Plain data answers only** | Answers must survive `structuredClone`; anything else returns `app.answer_invalid` |
+
+A restart of the App's Durable Object clears in-memory state (including watcher sets) but never touches the SQLite database. When permissions change — a grant or revoke — core restarts the App and rebuilds its env, so the next call picks up the updated stubs.

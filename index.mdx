@@ -1,20 +1,60 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Grasp OS: AI Operating System for Your Organization"
+sidebarTitle: "Home"
+description: "Grasp OS brings company knowledge, durable workflows, App screens, and AI agents together in one platform — deployed into your own Cloudflare account."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Grasp OS is an internal operating system for AI at work. It gives your organization a single place for company knowledge, Apps with React screens and durable workflows, an AI agent, and the governance controls — permissions, audit log, model gateway — that make running AI in a business safe and auditable. Every deployment runs in your own Cloudflare account, in the EU jurisdiction, with your data never leaving it.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    What Grasp OS is, who it is for, and how its pieces fit together.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    The five Workers, six packages, and how they connect at runtime.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Set up a local dev environment and write your first workflow in minutes.
+  </Card>
+  <Card title="Core Concepts" icon="lightbulb" href="/concepts/apps">
+    Apps, workflows, knowledge, connectors, permissions, and the audit log.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## Build with Grasp OS
+
+<CardGroup cols={2}>
+  <Card title="Apps" icon="grid-2" href="/apps/overview">
+    Create Apps with server-side Durable Objects, React screens, and exported methods.
+  </Card>
+  <Card title="Workflow SDK" icon="code" href="/sdk/workflow">
+    Write durable workflows with `step.do`, `step.llm`, `step.decision`, and `step.sleep`.
+  </Card>
+  <Card title="Screen Hooks" icon="browser" href="/sdk/screen">
+    Connect React screens to your App's server with `useLive` and `useWorkflow`.
+  </Card>
+  <Card title="Connectors" icon="plug" href="/connectors/overview">
+    Integrate external systems through the connector layer — the only OAuth and egress point.
+  </Card>
+</CardGroup>
+
+## Platform & Operations
+
+<CardGroup cols={2}>
+  <Card title="Deployment" icon="cloud" href="/platform/deployment">
+    Deploy Grasp OS into a Cloudflare account with Wrangler and the console.
+  </Card>
+  <Card title="Audit Log" icon="shield-check" href="/platform/audit-log">
+    Every model call, connector action, and permission change is recorded in a hash-chained log.
+  </Card>
+  <Card title="Security" icon="lock" href="/platform/security">
+    Sandbox architecture, capability tokens, EU jurisdiction, and threat model.
+  </Card>
+  <Card title="Releases" icon="tag" href="/platform/releases">
+    Ring-based releases through the console, with feature flags and kill switches.
+  </Card>
+</CardGroup>
+
+<Note>
+  Grasp OS is deployed once per client into the client's own Cloudflare account. Configuration and in-product content (Apps, workflows) are how clients customize Grasp — never by forking this repository.
+</Note>

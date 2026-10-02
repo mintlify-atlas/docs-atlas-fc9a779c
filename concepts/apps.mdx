@@ -1,0 +1,171 @@
+---
+title: "Apps: Versioned TypeScript Programs in Grasp OS"
+sidebarTitle: "Apps"
+description: "A versioned tree of TypeScript files — Durable Object server, React screens, workflows, and exports — committed, reviewed, and deployed as one unit."
+---
+
+An App is the primary unit of customisation in Grasp OS. Each App is a tree of TypeScript files — a server class backed by a Cloudflare Durable Object, optional React screens, workflow definitions, and an exports declaration — versioned as a whole and deployed per-client. Apps start with access to nothing; every resource they need is an explicit permission an admin grants. The agent writes Apps in Code Mode, proposing versions that a builder reviews before making them current.
+
+## File structure
+
+An App's files follow a conventional layout. Core reads and builds specific paths; everything else is shared code the standard entries may import.
+
+```text
+app/server.ts       ← Durable Object class (required)
+app/exports.json    ← Methods other Apps may call (optional)
+app/records.json    ← Record types the App writes to Knowledge (optional)
+screens/inbox.tsx   ← React screen named "inbox" (optional, repeatable)
+workflows/report.ts ← Workflow named "report" (optional, repeatable)
+```
+
+<Note>
+  Files are keyed by path. Segments must match `[\\w-][\\w.-]*` — no leading dots, no `..`, no backslashes. The full path may be at most 256 characters and four levels deep. The platform enforces this at commit time.
+</Note>
+
+Screens are named by their filename without the extension (`screens/inbox.tsx` → `"inbox"`). Workflows are named by their workflow ID declared in code, which must match the filename (`workflows/report.ts` → `"report"`).
+
+## Version model
+
+Every change to an App is a **commit**: a new version in the version history, immutable once created. Versions never change; removing or altering behaviour always means adding a new version.
+
+<Steps>
+  <Step title="Commit">
+    A builder (or the agent, for a builder) calls `files.commit` with a set of file changes and a message. Core builds the screens, server code, and workflows immediately and returns the diagnostics. A build failure never blocks the commit — it is recorded but the version is created.
+  </Step>
+  <Step title="Propose (optional)">
+    A builder calls `versions.propose` to mark a version as **pending** — up for review. Admins and builders see the pending version in the UI and may review what changed against the current version.
+  </Step>
+  <Step title="Make current">
+    A builder calls `versions.setCurrent`. The version becomes the one that runs. All triggers it declares take effect; triggers the previous version declared that are no longer present stop. If the person making it current is not an admin, any permissions the App holds on connections, writable collections, workflows, or another App's `write`-marked exports revert to `requested` status until an admin grants them again.
+  </Step>
+</Steps>
+
+At any moment an App has at most one **current** version (the one that runs) and at most one **pending** version (awaiting review). Older versions are kept in history and can be read or rolled back to at any time.
+
+```typescript
+// packages/shared/src/apps.ts
+/** A version of an App: 1 for its first commit, then 2, 3, … */
+export const appVersionSchema = z.int().min(1);
+
+/** An App in the registry. Times are ISO 8601. */
+export interface App {
+  id: AppId;
+  name: string;
+  description: string;
+  /** The user who created it. */
+  owner: string;
+  /** The version that runs; null until one is made current. */
+  currentVersion: number | null;
+  /** The version up for review, if any. */
+  pendingVersion: number | null;
+  createdAt: string;
+}
+```
+
+## The App owner
+
+Every App has one **owner** — the user who created it, always a builder. The owner matters in two important ways:
+
+1. **Triggered runs** — when a workflow run is started by a trigger (schedule, event, or email), the run acts on behalf of the App's owner, not a signed-in user. If the owner leaves the organisation the run fails.
+2. **Default access** — the owner always has the `builder` role in the App and is never removed from its member list.
+
+The owner is stored as a user ID (`owner: string` on `App`). There is currently no API to transfer ownership.
+
+## App methods and the naming convention
+
+App server code is a TypeScript class that extends `DurableObject`. Core calls its methods on behalf of whoever is using the App — the signed-in user through a screen, or a workflow run. Only names matching the `appMethodPattern` regex are callable:
+
+```typescript
+// packages/shared/src/apps.ts
+/**
+ * A name core calls as an App's method: an identifier that starts with a
+ * lowercase letter, of at most 64 letters and digits, and not reserved.
+ */
+export const appMethodPattern = /^[a-z][A-Za-z0-9]{0,63}$/u;
+```
+
+A method name must:
+- Start with a **lowercase letter**
+- Contain only **letters and digits** (no underscores, hyphens, or dots)
+- Be at most **64 characters**
+- Not be one of the reserved names (`alarm`, `fetch`, `constructor`, `connect`, `get`, `put`, `delete`, and others the Durable Object runtime uses)
+
+Methods receive the **caller** as their first argument — a typed `AppCaller` object the platform injects, which the method passes on to connection calls. App code never chooses the caller.
+
+```typescript
+// packages/shared/src/apps.ts
+export interface AppCaller {
+  userId: string;
+  /** A person is there (a screen), or a workflow runs on its own. */
+  mode: "interactive" | "workflow";
+  token: string;
+  /** For a workflow run's step: that step's idempotency key. */
+  idempotencyKey?: string;
+  /** For a call from another App, through one of its exports. */
+  app?: { id: string; version: number };
+}
+```
+
+<Warning>
+  Methods named `toJSON`, `then`, `hasOwnProperty`, or any name in `reservedAppMethods` are never called by core, even if they match the pattern. The SDK's typed stub also leaves them out. Core returns `app.method_invalid` for any such call.
+</Warning>
+
+## The App sandbox
+
+App server code runs in an isolated environment with deliberate restrictions:
+
+<CardGroup cols={2}>
+  <Card title="No direct network access" icon="ban">
+    Server code cannot call `fetch` or open sockets. All external calls go through the connector layer (`apps/connect`) via bound connection stubs in `env`.
+  </Card>
+  <Card title="Caller tokens, not credentials" icon="key">
+    Connection stubs in `env` act for the caller the platform injected. The App never holds OAuth tokens directly — connect adds them at egress.
+  </Card>
+  <Card title="Restricted environment" icon="lock">
+    The env only contains platform bindings and the stubs for permissions the App holds. No secrets, no raw KV, no R2. What isn't explicitly granted isn't reachable.
+  </Card>
+  <Card title="Version-pinned execution" icon="tag">
+    Code of a version no admin has approved changes nothing, even in a live run. Core checks the app version on every call and refuses unapproved side effects.
+  </Card>
+</CardGroup>
+
+## Exports: letting other Apps call in
+
+An App may declare **exports** — server methods that other Apps are permitted to call, under a permission an admin grants. Exports are declared in `app/exports.json`, versioned with the rest of the code:
+
+```json
+{
+  "findCustomers": {
+    "access": "read",
+    "description": "Customers whose name starts with the query",
+    "input": {
+      "type": "object",
+      "properties": { "query": { "type": "string" } },
+      "required": ["query"]
+    },
+    "output": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  }
+}
+```
+
+Each export has an `access` of `"read"` (the method only reads the App's data) or `"write"` (it may change it). A permission that grants `read` access covers all `read`-marked exports; `write` requires explicit admin approval on every new version that makes a current one current.
+
+## Code Mode: how the agent writes Apps
+
+When the agent writes an App in **Code Mode**, it works in a draft tied to the current chat. It calls `files.commit` to build and check each version, reads back any diagnostics, and iterates until the code is clean. Once ready, it calls `versions.propose` to put the version up for a builder's review. The builder reads the diff, reviews the changed steps and permissions, and calls `versions.setCurrent` to deploy.
+
+The agent imports types from the App's own server file as `import type`, never the implementation, and calls server methods through the `appServer` helper from `@grasp-os/sdk`:
+
+```typescript
+import type { App } from "../app/server.ts";
+import { appServer, workflow } from "@grasp-os/sdk";
+
+export default workflow("update-status", { params: {} }, async (step, { env }) => {
+  await step.do("update", { description: "Update the record", sideEffect: true }, async () => {
+    await appServer<App>(env).setStatus("INV-7", "booked");
+  });
+});
+```

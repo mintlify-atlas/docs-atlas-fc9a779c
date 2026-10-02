@@ -1,0 +1,90 @@
+---
+title: "Grasp OS: An AI Operating System for the Enterprise"
+sidebarTitle: "Introduction"
+description: "Per-client AI operating system on Cloudflare Workers in the EU, combining Apps, durable workflows, a knowledge base, an AI agent, and a model gateway."
+---
+
+Grasp OS is an internal operating system for AI at work. It ships once per client into that client's own Cloudflare account, always in the EU, giving each organisation a fully isolated deployment they control — not a shared SaaS tenant. Every model call is routed through one gateway, every call to an external system flows through one connector layer, and everything that happens lands in a tamper-evident audit log. The result is a platform where Apps, durable workflows, and AI agents can be built and deployed with clear governance from the start.
+
+## Who uses Grasp OS
+
+Grasp OS is an internal platform: it is operated by Grasp Labs and deployed per client, not distributed as open-source software for self-hosting. The people who work with the codebase are Grasp engineers building and evolving the platform itself. Clients customise Grasp through configuration and in-product content — Apps, workflows, and templates — never through code changes to this repository.
+
+## Key value propositions
+
+<CardGroup cols={2}>
+  <Card title="Per-client isolation" icon="server">
+    Every client gets their own Cloudflare Workers deployment, their own databases, and their own R2 buckets — all in the EU. There is no shared infrastructure between clients.
+  </Card>
+  <Card title="One gateway for every model call" icon="microchip-ai">
+    The model gateway in Core is the only path to any AI model. Deployment rules, budgets, and jurisdiction constraints are enforced uniformly before any token is sent.
+  </Card>
+  <Card title="One connector layer for every external call" icon="plug">
+    Connect is the only Worker that holds OAuth tokens and reaches outside systems. Apps and workflows never make raw HTTP calls; they go through a connector, which enforces capabilities.
+  </Card>
+  <Card title="Durable audit log" icon="shield-check">
+    Every action — model calls, connector calls, permission changes, workflow steps — lands in a hash-chained audit log that cannot be silently altered.
+  </Card>
+</CardGroup>
+
+## The five applications
+
+Grasp OS is a monorepo. Five Cloudflare Workers make up the runtime:
+
+| App | Path | What it does |
+|---|---|---|
+| **Core** | `apps/core` | Sign-in, knowledge base, Apps, workflow engine, model gateway, audit log |
+| **Connect** | `apps/connect` | OAuth tokens, MCP servers, and all egress to external systems |
+| **Web** | `apps/web` | React SPA frontend, served as static files by Core |
+| **Console** | `apps/console` | Staff console for provisioning client deployments and releasing updates |
+| **Router** | `apps/router` | Stateless hostname router: maps `*.<domain>` to each client's Core Worker |
+
+At runtime the Router receives every inbound request and proxies it to the right Core instance. Core calls Connect for any external action and calls its own model gateway for any LLM interaction. Connect is never reached directly from the internet.
+
+## The six packages
+
+Six workspace packages are shared across the apps:
+
+| Package | Path | What it is |
+|---|---|---|
+| `@grasp-os/sdk` | `packages/sdk` | The **only** API that App and workflow code is allowed to import |
+| `@grasp-os/ui` | `packages/ui` | shadcn on Base UI with Tailwind v4, shared with App screens |
+| `@grasp-os/compiler` | `packages/compiler` | Builds App screens from source |
+| `@grasp-os/connector-kit` | `packages/connector-kit` | How to write a native connector: manifest, tools, MCP server |
+| Native connectors | `packages/connectors/*` | Ready-made MCP servers loaded by Connect |
+| `@grasp-os/shared` | `packages/shared` | Shared TypeScript types and Zod schemas |
+
+## Platform pillars
+
+Grasp OS is built around seven platform pillars, each with its own section in these docs:
+
+<CardGroup cols={2}>
+  <Card title="Apps" icon="grid-2" href="/concepts/apps">
+    Apps are the unit of deployment for client-specific logic. Each App has a server class, optional screens (compiled React), and exported methods other Apps can call under permission.
+  </Card>
+  <Card title="Workflows" icon="diagram-project" href="/concepts/workflows">
+    Durable workflows run on Cloudflare Workflows. They import only `@grasp-os/sdk` and declare every step inline with its options. The code is the source of truth.
+  </Card>
+  <Card title="Knowledge base" icon="book-open" href="/concepts/knowledge">
+    A per-deployment D1 database that stores structured knowledge, surfaced to the AI agent and to Apps through the SDK.
+  </Card>
+  <Card title="AI agent" icon="robot" href="/concepts/apps">
+    The built-in agent uses the knowledge base, the model gateway, and the connector layer to answer questions and take actions on behalf of users.
+  </Card>
+  <Card title="Model gateway" icon="microchip-ai" href="/concepts/apps">
+    Every LLM call goes through Core's model gateway. It applies deployment rules — jurisdiction constraints, per-App model budgets, data sensitivity guards — before forwarding to Cloudflare AI Gateway.
+  </Card>
+  <Card title="Connectors" icon="plug" href="/concepts/connectors">
+    Connectors give Apps and workflows access to outside systems. Native connectors are MCP servers bundled in `packages/connectors/*`; third-party connectors go through Composio.
+  </Card>
+  <Card title="Audit log" icon="shield-check" href="/concepts/audit-log">
+    A hash-chained, tamper-evident log of every significant event, archived to R2 after its retention window.
+  </Card>
+  <Card title="Permissions" icon="lock" href="/concepts/permissions">
+    Apps and agents start with access to nothing. Every resource — a connector, another App's exports, a knowledge collection — needs an explicit permission granted by an admin.
+  </Card>
+</CardGroup>
+
+## License
+
+Grasp OS is released under [AGPL-3.0](https://github.com/grasplabs/os/blob/main/LICENSE). The license applies to the platform code in this repository. Client-authored Apps and workflow code are not affected by the platform's license.

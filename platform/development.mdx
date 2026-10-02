@@ -1,0 +1,200 @@
+---
+title: "Local Development Workflow and Conventions for Grasp OS"
+sidebarTitle: "Development"
+description: "Set up your local environment, run Workers and the frontend together, fix and test your changes, and follow the conventions CI enforces before merge."
+---
+
+Grasp OS uses **Vite+** (`vp`) as its unified toolchain for everything from installing dependencies and running the dev server to executing tests and generating types. All `vp` commands are run from the repository root unless a `-C <path>` or `--filter` flag narrows them to a specific app. The first time you clone the repo, `vp install` sets up both dependencies and the git hooks that enforce commit and branch conventions locally — before CI gets a chance to object.
+
+## First-time setup
+
+<Steps>
+  <Step title="Install dependencies and git hooks">
+    ```bash
+    vp install
+    ```
+
+    This installs all workspace dependencies and registers three git hooks:
+
+    | Hook | What it enforces |
+    |---|---|
+    | `commit-msg` | Commit messages follow [Conventional Commits](https://www.conventionalcommits.org): `feat(core): …`, `fix(connect): …`, `chore(deps): …` |
+    | `pre-commit` | `secretlint` scans staged files for secrets, client names, and client config |
+    | `pre-push` | Branch name matches `<type>/<kebab-description>` (e.g. `feat/audit-export`) |
+
+  </Step>
+  <Step title="Copy .dev.vars files">
+    Each Worker app has a `.dev.vars.example` that documents the secrets Wrangler will load locally. Copy it to `.dev.vars` and fill in the values.
+
+    ```bash
+    cp apps/core/.dev.vars.example apps/core/.dev.vars
+    cp apps/connect/.dev.vars.example apps/connect/.dev.vars
+    ```
+
+    Generate the shared secret values — `BETTER_AUTH_SECRET` and `CAPABILITY_SIGNING_KEY` must each be at least 32 characters, and `CAPABILITY_SIGNING_KEY` must be the same value in both files:
+
+    ```bash
+    openssl rand -base64 32
+    ```
+
+    See the [Configuration reference](/platform/configuration) for a full description of each secret.
+  </Step>
+</Steps>
+
+## Running the development server
+
+```bash
+vp run dev
+```
+
+This starts the full local stack:
+
+- **Frontend** (React SPA, `apps/web`) — [`localhost:5173`](http://localhost:5173), with HMR
+- **Core + Connect Workers** — [`localhost:8787`](http://localhost:8787), behind the frontend's Vite proxy
+
+The dev server bypasses the router-secret check for `localhost` requests, so `ROUTER_SECRET` can be left empty in `apps/core/.dev.vars`. Sign-in uses a local fake IdP (`scripts/dev.ts`): any `@acme.test` email address is accepted, and `admin@acme.test` gets admin access.
+
+To run the staff console instead:
+
+```bash
+vp -C apps/console dev
+```
+
+<Info>
+  Deployment config vars (`SIGN_IN`, `MODEL_GATEWAY`, and others) are not read from `.dev.vars` — Wrangler only loads the secrets listed in `secrets.required` from that file. Pass config vars on the command line if you need them: `wrangler dev --var NAME:<value>`.
+</Info>
+
+## Checking your code
+
+```bash
+# Format, lint, and type-check everything
+vp check
+
+# Auto-fix formatting and lint issues
+vp check --fix
+```
+
+`vp check` runs three tools in sequence:
+
+| Tool | What it checks |
+|---|---|
+| **Oxfmt** (via Ultracite) | Code formatting |
+| **Oxlint + @shadcn/lint** (via Ultracite) | Lint rules; `@shadcn/lint` names the component, variant, or token to use instead of raw colours, arbitrary values, or inline styles |
+| **tsgo** | TypeScript type checking across the whole workspace |
+
+Most lint issues are auto-fixable with `--fix`. For issues the linter flags but can't fix automatically, the error message identifies the rule and usually the correct pattern to use.
+
+## Running tests
+
+```bash
+vp test
+```
+
+Worker tests run inside **workerd**, Cloudflare's open-source runtime, so they execute against the same environment as production. Tests go in through public interfaces — Worker requests, RPC calls, Durable Object calls, workflow runs — and mock only outside systems like model providers or Microsoft Graph, never internal modules.
+
+```bash
+# Run with all CPU cores (matches CI)
+vp test --maxWorkers=100%
+```
+
+<Tabs>
+  <Tab title="Integration tests (default)">
+    The primary test style. Tests live alongside the source they cover and use `.test.ts` suffixes. They go in through real boundaries: HTTP requests to the Worker, Durable Object calls, workflow replays. No mocking of internal modules.
+  </Tab>
+  <Tab title="Unit tests">
+    Reserved for pure logic with no I/O: permission evaluation, the audit hash chain, parsers. Same file convention, same runner.
+  </Tab>
+  <Tab title="End-to-end tests">
+    Playwright tests for critical user journeys. Files use the `*.e2e.ts` suffix and live in `e2e/`. Run separately:
+
+    ```bash
+    vp run e2e
+    ```
+
+    A failing test is retried with a trace as its artifact. CI uploads traces from failing runs and retains them for 14 days.
+  </Tab>
+</Tabs>
+
+## On-prem readiness smoke test
+
+```bash
+vp run smoke:workerd
+```
+
+Boots the core Worker on **plain workerd** — without Cloudflare-specific platform bindings — to verify it would run in an on-prem deployment profile. CI runs this as a separate `workerd` job on every pull request. If core relies on a Cloudflare-only API that has no on-prem adapter, this test fails.
+
+## Regenerating generated files
+
+CI enforces that generated files are always committed. After changing a `wrangler.jsonc` or a database schema, regenerate and commit the result before pushing.
+
+```bash
+# Regenerate worker-configuration.d.ts after changing any wrangler.jsonc
+vp run -r typegen
+
+# Generate new D1 migrations after changing a Drizzle schema
+vp run -r db:generate
+```
+
+<Warning>
+  When you have a merge conflict in a generated file (lockfile, Worker types, route trees), do **not** merge it by hand. Take either side and regenerate: `vp install` for the lockfile, `vp run -r typegen` for Worker types, `vp run -r build` for route trees. For migrations specifically, keep `main`'s migration files, delete yours, and run `vp run -r db:generate` so yours come after them. A migration already on `main` never changes — `vp run check:migrations` enforces this.
+</Warning>
+
+## Conventions
+
+### Branches
+
+Branch from `main` as `<type>/<kebab-description>`, using one of the Conventional Commits types as the prefix:
+
+```text
+feat/audit-export
+fix/connect-token-refresh
+chore/bump-wrangler
+refactor/model-gateway-rules
+```
+
+The `pre-push` hook and a CI `check:branch` step both verify the branch name. A branch that doesn't match the pattern can't be pushed.
+
+### Commits and PR titles
+
+All commits and PR titles follow **[Conventional Commits](https://www.conventionalcommits.org)**. The scope is the app or package name:
+
+```text
+feat(core): add audit export endpoint
+fix(connect): retry token refresh on 429
+chore(deps): update wrangler to 4.x
+refactor(sdk): simplify workflow step API
+```
+
+PRs are squash-merged, so the PR title becomes the single commit on `main` and the release note the console displays. The `commit-msg` hook and a CI `conventions` job enforce the format.
+
+### No Markdown in the repo
+
+The only Markdown files permitted in the repository are `README.md`, `AGENTS.md`, and files under `.github/` (templates and workflow files). CI's `check:docs` step rejects any other `.md` files. Plans, ADRs, design notes, and research belong outside the repo. Put the *why* in code comments at the decision site and in PR descriptions.
+
+## CI overview
+
+Every pull request runs the following checks. The merge queue re-runs them on top of the latest `main` before squash-merging.
+
+<Accordion title="check — format, lint, type-check, tests, build">
+  Runs `vp check`, `vp run check:secrets`, `vp run check:docs`, `vp run check:migrations`, `vp run check:wrangler-configs`, then `vp test --maxWorkers=100%`, then `vp run -r build`. Finishes by regenerating all generated files and asserting `git diff` is clean — any uncommitted generated file fails the build.
+</Accordion>
+
+<Accordion title="e2e — Playwright end-to-end">
+  Runs the full Playwright suite (`vp run e2e`). Failing tests are retried with a trace; traces are uploaded as an artifact and kept for 14 days.
+</Accordion>
+
+<Accordion title="workerd — on-prem smoke test">
+  Builds the frontend, then runs `vp run smoke:workerd` to confirm core boots on plain workerd.
+</Accordion>
+
+<Accordion title="release — release bundle dry-run">
+  Builds the release bundle (core, connect, frontend static files, D1 migrations, and manifest) and verifies every blob against the manifest. Nothing is uploaded to R2; this is a correctness check only.
+</Accordion>
+
+<Accordion title="conventions — branch name and PR title (PRs only)">
+  Verifies the branch name matches `<type>/<kebab-description>` and that the PR title parses as a valid Conventional Commit. Skipped in the merge queue (which counts as passing).
+</Accordion>
+
+<Note>
+  Nobody pushes to `main` directly. In an emergency, organisation owners can merge without a second review or passing checks — GitHub records every bypass. The branch ruleset lives in `.github/rulesets/`; apply changes with `vp run github:setup`.
+</Note>

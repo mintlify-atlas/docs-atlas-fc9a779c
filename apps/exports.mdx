@@ -1,0 +1,166 @@
+---
+title: "App Exports: Typed Methods Other Apps Can Call"
+sidebarTitle: "Exports"
+description: "app/exports.json declares the server methods other Apps may call under a permission. Learn the manifest format, read vs. write access, call limits, and idempotency."
+---
+
+An App can expose a curated set of its server methods to other Apps. These **exports** are declared in `app/exports.json`, versioned alongside all other code, and accessed by callers through a typed stub from `@grasp-os/sdk/workflow`. Every call is checked by core: the export must exist in the current version, the calling App must hold a permission that allows the action, and the input and output must each match the declared JSON Schema. No export is reachable without an admin-granted permission.
+
+## The `app/exports.json` manifest
+
+The file is a JSON object mapping each exported method name to its declaration. Method names follow the same rules as server method names — starting with a lowercase letter, letters and digits only, up to 64 characters, and not a reserved name. An App may declare at most 64 exports.
+
+```json
+{
+  "findCustomers": {
+    "access": "read",
+    "description": "Customers whose name starts with the query",
+    "input": {
+      "type": "object",
+      "properties": { "query": { "type": "string" } },
+      "required": ["query"]
+    },
+    "output": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  },
+  "createInvoice": {
+    "access": "write",
+    "description": "Creates a new invoice for the customer",
+    "input": {
+      "type": "object",
+      "properties": {
+        "customerId": { "type": "string" },
+        "amount": { "type": "integer" }
+      },
+      "required": ["customerId", "amount"]
+    },
+    "output": {
+      "type": "object",
+      "properties": { "id": { "type": "string" } },
+      "required": ["id"]
+    }
+  }
+}
+```
+
+Each export's `input` and `output` are JSON Schemas. Core validates every call against them using `z.fromJSONSchema`. Only the keywords Zod enforces are permitted — `type`, `properties`, `required`, `items`, `minLength`, `maxLength`, `minimum`, `maximum`, `enum`, `anyOf`, `oneOf`, and so on. Keywords core doesn't check (like `pattern`, `patternProperties`, or `$ref`) are rejected at commit time with `app.exports_invalid`.
+
+<Tip>
+Keep schemas tight. Core checks the calling App's input against `input` and the answering App's return value against `output`; a mismatch returns `app.call_invalid` or `app.answer_invalid` to the caller.
+</Tip>
+
+## Read vs. write exports
+
+Every export is marked `access: "read"` or `access: "write"`:
+
+| Access | What it means | Permission requirement |
+|---|---|---|
+| `read` | Only reads the App's data; no side effects | A permission granting `read` suffices |
+| `write` | Changes the App's data or triggers side effects | Requires a permission granting `write`; additionally, the calling App's version must have been **admin-approved** |
+
+The write requirement is what makes the system safe to operate. When a builder makes a new version current that calls a write export, an admin reviews the version's diff (its changed steps, bindings, and permission requests) and grants or re-grants the permission. Until an admin approves the specific version making the call, `write` calls are refused. `read` calls from unapproved versions are allowed.
+
+<Warning>
+Removing or changing an export requires a new version. The export as declared in a version never changes — a call that was valid for version 3 is still valid for version 3 even after version 4 renames the method. Core checks exports against the **current** version at call time.
+</Warning>
+
+## Calling exports from a workflow
+
+Use `appExports<Exports>(env.BINDING)` from `@grasp-os/sdk/workflow`, where `BINDING` is the permission's binding name as configured in the App's settings. Type `Exports` with a local interface that mirrors the exported methods, with each method taking its input type and returning its output type:
+
+```ts
+import { appExports, workflow } from "@grasp-os/sdk/workflow";
+
+type Crm = {
+  findCustomers: (input: { query: string }) => { id: string; name: string }[];
+};
+
+export default workflow("create-order", { params: {} }, async (step, { env, input }) => {
+  const found = await step.do(
+    "find-customer",
+    { description: "Find the customer in the CRM" },
+    async () =>
+      await appExports<Crm>(env.CRM).findCustomers({ query: input.customer })
+  );
+});
+```
+
+`appExports` returns an `AppExportsStub<Exports>` — a Proxy that turns every property access into a typed method call to `env.CRM.call(name, input)`. Core validates the name, the input schema, and the output schema on every call.
+
+## The `AppExportsStub<Exports>` type
+
+```ts
+export type AppExportsStub<Exports> = {
+  readonly [
+    Name in keyof Exports as /* method names core calls */
+  ]: Exports[Name] extends (input: infer Input) => infer Answer
+    ? (input: Input) => Promise<Awaited<Answer>>
+    : never;
+};
+```
+
+Each method takes exactly one argument (the `input`), matching the export's declared input schema, and returns a `Promise` of the output. Reserved names (`read`, `write`, `toJSON`, and all `reservedAppMethods`) are excluded from the stub even if the type declares them.
+
+## Idempotency for write exports
+
+Each call to a write export inside a `sideEffect: true` step carries that step's idempotency key through to the called App's server. This means:
+
+- **Make one write export call per step.** If a step retries, the called App sees the same idempotency key and can de-duplicate the effect.
+- A second write export call within the same step reuses the first call's side-effect answers, rather than making new ones.
+
+```ts
+await step.do(
+  "create-invoice",
+  { description: "Create the invoice", sideEffect: true, input: { customerId: found[0].id } },
+  async ({ input }) => {
+    // One write export call per sideEffect step
+    return await appExports<Crm>(env.CRM).createInvoice({
+      customerId: input.customerId,
+      amount: 150_00,
+    });
+  }
+);
+```
+
+## Size limits
+
+Core enforces payload size limits on every inter-App call, defined in `appCallLimits`:
+
+| Limit | Value |
+|---|---|
+| Input (UTF-8 bytes) | 256 KiB |
+| Answer (UTF-8 bytes) | 1 MiB |
+| Call depth | 3 hops (4 Apps: A → B → C → D) |
+
+A call whose input exceeds 256 KiB, or whose answer exceeds 1 MiB, fails with `app.call_too_large`. Calls beyond 3 hops fail with `app.call_too_deep`. An App calling itself (directly or via a chain) fails with `app.call_cycle`. All of these are non-retryable.
+
+## What core checks on every call
+
+Core validates each call in order:
+
+<Steps>
+  <Step title="Method name">
+    The name must match `appMethodPattern` — a lowercase letter followed by up to 63 letters and digits — and must not be reserved. Fails with `app.method_invalid`.
+  </Step>
+  <Step title="Export exists in current version">
+    The name must be in the App's current version's `app/exports.json`. Fails with `app.export_not_found` if the export was removed or the App has no current version.
+  </Step>
+  <Step title="Permission allows the action">
+    The calling App must hold a permission that allows `read` or `write` on this export. A `write` export requires the calling App's version to have been admin-approved. Fails with an appropriate permission error otherwise.
+  </Step>
+  <Step title="Input matches declared schema">
+    The input JSON is validated against the export's `input` schema via `z.fromJSONSchema`. Fails with `app.call_invalid`.
+  </Step>
+  <Step title="Method runs">
+    The called App's server method runs in its own sandbox. Errors from the method surface as `app.failed`.
+  </Step>
+  <Step title="Output matches declared schema">
+    The answer is validated against the export's `output` schema. Fails with `app.answer_invalid` if the server returns something that doesn't match.
+  </Step>
+</Steps>
+
+<Note>
+If either the calling App or the called App has read restricted data — from a personal connection or a collection the person can't read elsewhere — both Apps are placed in restricted mode from that point on. Subsequent write calls require explicit confirmation from the person the run acts for.
+</Note>

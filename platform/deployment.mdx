@@ -1,0 +1,139 @@
+---
+title: "Deploying Grasp OS to a Client Cloudflare Account"
+sidebarTitle: "Deployment"
+description: "How Grasp OS is provisioned and deployed: one isolated Cloudflare deployment per client, in the EU, coordinated by the staff console."
+---
+
+Grasp OS is deployed once per client, directly into the client's own Cloudflare account — never as a shared multi-tenant service. Each deployment is fully isolated: its own Workers, its own D1 databases, its own R2 buckets, and its own secrets. The staff console in `grasp-os-ops` (Grasp's own Cloudflare account) orchestrates every provisioning step and coordinates rolling releases across clients ring by ring. You never deploy to a client account manually from a local machine; the console is the only path.
+
+## Architecture overview
+
+A complete Grasp OS installation consists of five named Workers spread across two Cloudflare accounts.
+
+<CardGroup cols={2}>
+  <Card title="grasp-os-core" icon="server">
+    The main Worker: sign-in, knowledge base, Apps, workflows, the model gateway, and the audit log. Deployed into the **client's account**.
+  </Card>
+  <Card title="grasp-os-connect" icon="plug">
+    The connector Worker: OAuth token vault, MCP servers, and all egress. The only place credentials and tokens live. Deployed into the **client's account**.
+  </Card>
+  <Card title="grasp-os-web" icon="globe">
+    The React SPA frontend. Its static assets are bundled into `grasp-os-core` via the `ASSETS` binding and served by the core Worker — there is no separate web Worker to deploy.
+  </Card>
+  <Card title="grasp-os-console" icon="terminal">
+    The staff console (TanStack Start). Runs in **`grasp-os-ops`**, Grasp's own account. Deployed manually via the `Deploy grasp-os-ops` GitHub Actions workflow, not from CI on merge.
+  </Card>
+  <Card title="grasp-os-router" icon="route">
+    The stateless hostname router: maps `*.<domain>` to each client's core Worker. Runs in **`grasp-os-ops`**. Also deployed manually to `grasp-os-ops`, independently of core and connect.
+  </Card>
+</CardGroup>
+
+<Note>
+  Core reaches connect through a Cloudflare **service binding** (`CONNECT`), not over the public internet. Connect's `workers_dev` is `false` — it is unreachable from outside core.
+</Note>
+
+## EU jurisdiction strategy
+
+Every persistent resource is anchored to the EU at creation time. This cannot be changed after the fact; a resource provisioned outside the EU has to be deleted and recreated.
+
+| Resource | How EU jurisdiction is enforced |
+|---|---|
+| R2 buckets (`grasp-os-files`, `grasp-os-audit-archive`) | `"jurisdiction": "eu"` in `wrangler.jsonc` |
+| Durable Objects (`Workspace`, `App`, `AuditLog`, `Builtins`) | `jurisdiction("eu")` call in `src/durable-objects.ts` at runtime |
+| D1 databases (`grasp-os-core`, `grasp-os-knowledge`, `grasp-os-connect`) | `--jurisdiction eu` flag when the database is created by the console |
+| Cloudflare Workflows runs | `weur` location hint on each run (a preference Cloudflare may not honour) |
+
+<Warning>
+  D1 databases and R2 buckets are assigned their jurisdiction only when they are **created**. If Wrangler auto-provisions a missing database during a deploy, it lands outside the EU. Always pre-create databases and buckets with the console (or the CI script) before the first deploy. A database already outside the EU must be deleted and recreated — there is no migration path.
+</Warning>
+
+## Deployment flow
+
+The console handles every step of provisioning and releasing. Here is what happens when a new client deployment is set up, and what happens on each subsequent release.
+
+<Steps>
+  <Step title="Pre-create D1 databases in the EU">
+    The console (or CI for staging) calls `wrangler d1 create <name> --jurisdiction eu` for each of the three databases: `grasp-os-core`, `grasp-os-knowledge`, and `grasp-os-connect`. If a database with that name already exists, its jurisdiction is verified; a non-EU database stops the process immediately.
+  </Step>
+  <Step title="Pre-create R2 buckets in the EU">
+    The `grasp-os-audit-archive` bucket is created with `--jurisdiction eu` before any deploy. `grasp-os-files` has `"jurisdiction": "eu"` in `wrangler.jsonc` and is also created up front.
+  </Step>
+  <Step title="Run D1 migrations">
+    Migrations are applied before any Worker is deployed, starting with connect (because core's service binding points to it). Migrations are additive: the running code keeps working against the new schema until the next Worker deploy replaces it.
+
+    ```bash
+    vp run --filter @grasp-os/connect db:migrate
+    vp run --filter @grasp-os/core db:migrate
+    ```
+  </Step>
+  <Step title="Deploy connect, then core">
+    Connect is deployed first. Core follows, bringing its bundled frontend assets with it.
+
+    ```bash
+    vp run --filter @grasp-os/connect deploy
+    vp run --filter @grasp-os/core deploy
+    ```
+  </Step>
+  <Step title="Console records the release">
+    Once staging passes, CI publishes a release bundle to R2 in `grasp-os-ops`. The console imports it and makes it available to roll out to clients ring by ring.
+  </Step>
+</Steps>
+
+## Building and testing before deployment
+
+Before any deployment, build the full workspace and run the on-prem readiness smoke test.
+
+```bash
+# Build every app and package
+vp run -r build
+
+# Verify core boots on plain workerd (on-prem readiness)
+vp run smoke:workerd
+```
+
+The `smoke:workerd` test boots core on plain workerd — without any Cloudflare-specific APIs — to verify it would work in an on-prem profile. CI runs this check on every pull request in its own `workerd` job.
+
+## Wrangler authentication
+
+Wrangler is authenticated through the **1Password shell plugin**. There are no `CLOUDFLARE_API_TOKEN` environment variables checked in anywhere. In CI, the `1password/load-secrets-action` loads credentials from a per-environment 1Password service account — one account for `grasp-os-staging`, one for `grasp-os-releases` — each scoped only to its own vault.
+
+```bash
+# Local: the 1Password shell plugin injects credentials automatically
+wrangler whoami
+
+# CI uses the 1Password action (see .github/workflows/ci.yml)
+# CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are loaded from 1Password,
+# never stored as plain GitHub secrets.
+```
+
+<Warning>
+  Never store Cloudflare API tokens as plain text in GitHub Actions secrets, `.env` files, or shell profiles. Always use the 1Password shell plugin locally and the `1password/load-secrets-action` in CI.
+</Warning>
+
+## Required secrets
+
+These three secrets must be set on the core Worker before deployment succeeds. Wrangler's `secrets.required` list causes a deploy to fail if any of them is absent.
+
+| Secret | Worker | Purpose |
+|---|---|---|
+| `ROUTER_SECRET` | core | The secret the router sends on every inbound request. Core derives and verifies it; during rotation, `ROUTER_SECRET_PREVIOUS` is also accepted. |
+| `BETTER_AUTH_SECRET` | core | Signs session cookies and encrypts sign-in state. Must be at least 32 characters. |
+| `CAPABILITY_SIGNING_KEY` | core + connect | Core signs a capability for every call it makes to connect; connect verifies it. The same value must be set on both Workers. |
+
+Connect requires only `CAPABILITY_SIGNING_KEY`. The other connect secrets (`TOKEN_ENCRYPTION_KEY`, provider OAuth credentials, `COMPOSIO_API_KEY`) are set by the console and not declared as `required` — connect handles their absence gracefully by refusing to connect the relevant provider.
+
+## Deployment config vars
+
+These vars are set by the console through the Cloudflare API after deployment. Because `keep_vars: true` is set in `wrangler.jsonc` for both core and connect, each Wrangler deploy preserves them rather than deleting them.
+
+| Var | Worker | Notes |
+|---|---|---|
+| `SIGN_IN` | core | Identity provider settings: Entra and Google OAuth client IDs, allowed domains. Without it, nobody can sign in. |
+| `MODEL_GATEWAY` | core | AI Gateway URL, allowed models, and model rules. Without it, core falls back to the account's default gateway and Workers AI models. |
+| `PLATFORM_CHANGE` | core | Who made this release and what changed. The cron records it in the audit log once per deployed version. |
+| `AUDIT_RETENTION_DAYS` | core | How long run details are kept. Default 180 days, minimum 30. |
+| `AUDIT_ARCHIVE_RETENTION_DAYS` | core | Age at which archived audit events are purged. Minimum 365 days and at least `AUDIT_RETENTION_DAYS`. Unset means archived events are never purged. |
+
+<Info>
+  These vars are intentionally absent from `wrangler.jsonc`. If they were listed there, every Wrangler deploy would overwrite the console's values. The `keep_vars: true` setting is what protects them.
+</Info>

@@ -1,0 +1,132 @@
+{
+  "projectType": "saas",
+  "projectName": "Grasp OS",
+  "projectDescription": "An internal operating system for AI at work — company knowledge, Apps with screens and durable workflows, agents, and governance controls, deployed per-client on Cloudflare Workers.",
+  "theme": "luma",
+  "primaryColor": "#6366F1",
+  "lightColor": "#EEF2FF",
+  "darkColor": "#312E81",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Overview",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "architecture",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/apps",
+              "concepts/workflows",
+              "concepts/knowledge",
+              "concepts/connectors",
+              "concepts/permissions",
+              "concepts/audit-log"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Building Apps",
+        "groups": [
+          {
+            "group": "Apps",
+            "pages": [
+              "apps/overview",
+              "apps/server",
+              "apps/screens",
+              "apps/exports"
+            ]
+          },
+          {
+            "group": "Workflow SDK",
+            "pages": [
+              "sdk/workflow",
+              "sdk/steps",
+              "sdk/params",
+              "sdk/triggers",
+              "sdk/screen",
+              "sdk/testing"
+            ]
+          },
+          {
+            "group": "Connectors",
+            "pages": [
+              "connectors/overview",
+              "connectors/building",
+              "connectors/native"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Platform",
+        "groups": [
+          {
+            "group": "Deployment",
+            "pages": [
+              "platform/deployment",
+              "platform/configuration",
+              "platform/development"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "platform/releases",
+              "platform/audit-log",
+              "platform/security"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Durable workflows with SDK: step.do, step.llm, step.decision, step.sleep",
+    "App screens with live server updates via useLive and useWorkflow hooks",
+    "Model gateway routing all LLM calls with rules, budgets and audit",
+    "Connector layer (connect Worker) as the sole OAuth and egress point",
+    "Knowledge base with versioned Markdown documents, search, and agent access",
+    "Hash-chained audit log covering every model call, connector action, and permission change",
+    "Permission system: Apps and agents start with nothing; every resource needs an explicit grant",
+    "Deployed per-client into the client's own Cloudflare account in the EU",
+    "Screen compiler that builds React screens with no network access (sandboxed iframes)",
+    "Agent (Pi in Code Mode) writing code against typed APIs to answer questions and take actions"
+  ],
+  "publicApiSurface": [
+    "workflow(id, config, run) — @grasp-os/sdk/workflow",
+    "step.do(name, options, fn) — runs plain code, durable",
+    "step.llm(name, options) — calls model gateway, validates schema",
+    "step.decision(name, options) — asks a person, waits for answer",
+    "step.sleep(name, options) — durably pauses the run",
+    "appServer<Server>(env) — typed stub for the App's own server methods",
+    "appExports<Exports>(binding) — typed stub for another App's exports",
+    "money / number / text / person / schedule / model / template — param helpers",
+    "WorkflowError — stable-coded error class",
+    "callServer(method, ...args) — @grasp-os/sdk/screen",
+    "useLive(method, initial, ...args) — @grasp-os/sdk/screen React hook",
+    "useWorkflow(workflow) — @grasp-os/sdk/screen React hook",
+    "useRun(workflow, run) — @grasp-os/sdk/screen React hook",
+    "followRuns(workflow, onRuns) — @grasp-os/sdk/screen",
+    "followRun(workflow, run, onRun) — @grasp-os/sdk/screen",
+    "describeWorkflow(source) — @grasp-os/sdk/describe",
+    "checkWorkflowBindings(source) — @grasp-os/sdk/describe",
+    "checkWorkflowModule(source) — @grasp-os/sdk/describe",
+    "createTestEngine(options) — @grasp-os/sdk/testing",
+    "testRun(definition, options) — @grasp-os/sdk/testing",
+    "dryRun(definition, options) — @grasp-os/sdk/testing",
+    "workflowTests(definition, tests) — @grasp-os/sdk/testing",
+    "runWorkflowTests(suite) — @grasp-os/sdk/testing",
+    "defineTool(definition) — @grasp-os/connector-kit",
+    "defineConnector(definition) — @grasp-os/connector-kit",
+    "ToolError — @grasp-os/connector-kit",
+    "CoreApi / SessionApi — @grasp-os/shared/rpc (Cap'n Web RPC root)"
+  ]
+}

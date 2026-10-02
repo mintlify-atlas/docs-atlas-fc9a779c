@@ -1,0 +1,161 @@
+---
+title: "Permissions: Explicit Grants for Every Resource Access"
+sidebarTitle: "Permissions"
+description: "Apps and agents start with nothing in Grasp OS. Every resource requires a permission — requested by a builder, granted by an admin, checked on every call."
+---
+
+Apps and agents in Grasp OS start with access to nothing. Before a workflow can call a connector, read a knowledge collection, start another workflow, or call another App's exports, a builder must request a permission and an admin must grant it. There are no ambient entitlements. Every call checks the permission again on the server — a revoked permission stops working immediately.
+
+<Note>
+  All permission records, capability tokens, and related data are stored in the EU. When any Durable Object or R2 resource is created for a permission, it is created with `jurisdiction("eu")` or the EU R2 jurisdiction constraint. This is set at resource creation time and cannot be changed.
+</Note>
+
+## Subjects: who holds a permission
+
+A permission has one **subject** — the App or agent it belongs to. People are never subjects; permissions govern code, not people.
+
+```typescript
+// packages/shared/src/permissions.ts
+export const permissionSubjectSchema = z.discriminatedUnion("type", [
+  z.strictObject({
+    type: z.literal("app"),
+    appId: appIdSchema,
+  }),
+  z.strictObject({
+    type: z.literal("agent"),
+    agentId: agentIdSchema,
+  }),
+]);
+```
+
+An agent's permissions are granted by an admin in the same way as an App's. An agent that hasn't been granted a permission on a collection cannot read it, even if the person it acts for can.
+
+## Objects: what a permission grants access to
+
+A permission's **object** is what it opens up. There are five kinds:
+
+```typescript
+// packages/shared/src/permissions.ts
+export const permissionObjectSchema = z.discriminatedUnion("type", [
+  z.strictObject({
+    type: z.literal("connection"),
+    connectionId: connectionIdSchema,
+    /** One resource in the connection; absent means the whole connection. */
+    resource: identifierSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal("collection"),
+    collectionId: collectionIdSchema,
+  }),
+  z.strictObject({
+    type: z.literal("workflow"),
+    appId: appIdSchema,
+    workflowId: workflowIdSchema,
+  }),
+  z.strictObject({
+    type: z.literal("app"),
+    appId: appIdSchema,
+  }),
+  z.strictObject({ type: z.literal("platform") }),
+]);
+```
+
+<Accordion title="Connection permissions">
+  A permission on a connection grants the App or agent access to call its tools. It can be scoped to the **whole connection** or to one **resource** within it (a specific mailbox, a specific drive). When scoped to a resource, a capability token is issued that restricts all outbound calls to that resource's path.
+
+  Connection permissions are the most common kind. Each is bound to a name in the App's `env` (e.g., `OUTLOOK`), and that binding is the only way to reach that connection from code.
+</Accordion>
+
+<Accordion title="Knowledge collection permissions">
+  A permission on a collection grants read or write access. `read` lets the App list, get, search, and read documents. `write` also lets it save and restore versions.
+
+  A `write` permission additionally lets the App claim **record types** — typed frontmatter schemas for documents it writes. The first App whose permission takes effect for a given type in a collection owns that type; later Apps that declare the same type for the same collection do not get it.
+</Accordion>
+
+<Accordion title="Workflow permissions">
+  A permission on a workflow grants `read` (list and see runs) or `start` (start new runs). This lets one App trigger a workflow in another App.
+</Accordion>
+
+<Accordion title="App export permissions">
+  A permission on another App's `app` object grants access to call its exported server methods. The `read` action covers all exports marked `read`; the `write` action requires an additional explicit admin grant on each new version. The calling App's code uses `appExports(env.TARGET)` to make typed calls.
+</Accordion>
+
+<Accordion title="Platform feature permissions">
+  Some platform capabilities require an explicit permission:
+
+  - **`statistics`** — access to the platform's published measures of Apps' runs (counts and sums of steps and costs). An App's own statistics need no permission; this covers reading other Apps' statistics.
+  - **`guests`** — the ability to invite external guests to a short chat session via a link, and to read back what they wrote.
+</Accordion>
+
+## Actions
+
+Each permission lists the **actions** it grants. Actions are specific to the object type:
+
+| Object type | Available actions |
+|-------------|-------------------|
+| `connection` | Tool names, such as `mail.list`, `mail.send`, `files.read`, `GMAIL_SEND_EMAIL` |
+| `collection` | `read`, `write` |
+| `workflow` | `read`, `start` |
+| `app` | `read`, `write`, or a specific export name |
+| `platform` | `statistics`, `guests` |
+
+A permission may list multiple actions (up to 16), but all must be valid for the object type. A connection action must match the pattern `[A-Za-z][\w.-]{0,63}`.
+
+## Permission status
+
+```typescript
+// packages/shared/src/permissions.ts
+export const permissionStatusSchema = z.enum(["requested", "active", "revoked"]);
+```
+
+| Status | What it allows |
+|--------|----------------|
+| `requested` | Nothing yet — waiting for an admin to grant it |
+| `active` | All listed actions on the object |
+| `revoked` | Nothing — permanently refused (request again for a new one) |
+
+A permission that was `active` may return to `requested` when a non-admin makes a new version of an App current. Specifically, permissions on connections, writable collections, workflows, and another App's `write`-marked exports revert to `requested` until an admin grants them again — approving the new version's code as they do.
+
+## How permissions are checked
+
+Every call that needs a permission goes through core's `authorize` function, which checks:
+
+1. The session is still valid (not expired, not revoked).
+2. The subject (App or agent) has an **active** permission on the object with the required action.
+3. For an App: the version making the call is the version the admin last approved. Code of an unapproved version changes nothing.
+4. The person the App or agent acts for is still a member of the organisation.
+5. The context (chat, App, or run) is not in **restricted mode** — if it has read sensitive data, it cannot call external systems.
+
+<Warning>
+  Restricted mode is permanent for the context that triggered it. If an App or workflow run reads from a sensitive collection, that entire context is blocked from making any further external calls (connector calls, other App exports). The block is recorded in the audit log under `context.restricted`.
+</Warning>
+
+## Requesting and granting: the UI flow
+
+<Steps>
+  <Step title="Request">
+    A builder (or the agent, on a builder's behalf) calls `permissions.request` with the subject, object, actions, and a binding name. The permission is created in `requested` status and is visible to admins.
+  </Step>
+  <Step title="Review">
+    Admins see the pending permission in the Permissions UI. For an App permission, they review the version of the App's code that is current at the time they decide. The `reviewed.version` they pass confirms which version they approved.
+  </Step>
+  <Step title="Grant or revoke">
+    An admin calls `permissions.grant` (with the `reviewed` version) or `permissions.revoke`. Both are audited. The grant is refused with `app.conflict` if another version became current between review and grant.
+  </Step>
+  <Step title="Enforcement">
+    From the moment a permission is granted or revoked, every subsequent call checks the new status. There is no cache invalidation delay.
+  </Step>
+</Steps>
+
+## Auditing grants and revokes
+
+Every grant and every revoke is written to the audit log immediately, under the `permission` event type. The log entry includes:
+
+- Who performed the action (the admin's user ID)
+- The subject (App ID or agent ID)
+- The object type and ID
+- The actions granted or revoked
+- The binding name
+- For a grant: the App version reviewed
+
+No sensitive data travels through the permission system — permissions are identified by IDs, never by names or content.

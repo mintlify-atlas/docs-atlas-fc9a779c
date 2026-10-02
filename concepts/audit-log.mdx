@@ -1,0 +1,177 @@
+---
+title: "Audit Log: Hash-Chained Record of Platform Events"
+sidebarTitle: "Audit Log"
+description: "Hash-chained log of model calls, connector actions, and permission changes — configurable retention, R2 archival, chain verification, and admin export."
+---
+
+The audit log is a permanent, tamper-evident record of everything significant that happens in a Grasp OS deployment. Every model call, connector action, permission change, workflow run event, sign-in, and platform update is written to the log the moment it occurs. Entries are linked in a hash chain — each entry records the hash of the one before it — so any alteration or deletion of an entry is detectable by verifying the chain. The log is admin-only for search and export; its append API is internal and not accessible through any session.
+
+## What is audited
+
+The audit log covers seven event types, each with its own actions:
+
+<Tabs>
+  <Tab title="Reads">
+    Events where data was accessed but nothing changed:
+    - Knowledge searches (`knowledge.search`) and document reads (`knowledge.read`)
+    - Connector calls that only read data (`connection.call` with `sideEffect: false`)
+    - Model calls that returned data (`model.*`)
+    - App export calls that only read (`app.call` with `access: "read"`)
+    - Agent calls that weren't otherwise recorded (`agent.call`)
+    - Audit log searches and exports (`audit.searched`, `audit.exported`, `audit.verified`)
+  </Tab>
+  <Tab title="Actions">
+    Events where something changed, externally or internally:
+    - Connector calls that changed something (`connection.call` with `sideEffect: true`)
+    - Workflow runs starting, stepping, and ending (`workflow.run.*`, `workflow.step.*`)
+    - Knowledge documents saved, restored, or purged
+    - Connection events dropped after the last delivery attempt
+  </Tab>
+  <Tab title="Decisions">
+    Events where a person made or was asked to make a choice:
+    - Workflow decisions opened, asked, answered, or timed out (`workflow.decision.*`)
+    - Pending actions confirmed or declined by a person (`connection.action`)
+    - Knowledge usage signal dismissed (`knowledge.signal.dismissed`)
+  </Tab>
+  <Tab title="Permissions">
+    Events touching access control:
+    - Permission granted or revoked (`permission.*`)
+    - A context entering restricted mode (`context.restricted`)
+    - Grasp staff signing in (`staff.session`)
+    - Guest invitations and revocations (`guest.invited`, `guest.revoked`)
+  </Tab>
+  <Tab title="Model calls">
+    Every call through the model gateway (`model.*`), including the model used, the step it came from (for workflow steps), and the cost. Budget alerts and exhaustions are logged under `model.budget`.
+  </Tab>
+  <Tab title="Config">
+    Configuration changes:
+    - Connections connected, reconnected, disconnected, or needing re-auth
+    - Knowledge collections created, changed, or deleted
+    - App code committed, versions made current
+    - Member and team changes
+    - Workflow parameter values set (`workflow.param`)
+  </Tab>
+  <Tab title="Platform updates">
+    Platform-level events such as releases deployed (`platform.*`).
+  </Tab>
+</Tabs>
+
+<Warning>
+  **Parameter values and sensitive data never appear in the audit log.** Workflow parameter values (including non-sensitive ones) are recorded without their value. Any field marked `sensitive` in a parameter declaration is treated with extra care in the UI, and its value is excluded from all log entries. The log records *that* a parameter was set, never *to what*.
+</Warning>
+
+## The hash chain
+
+Every entry in the audit log is linked to the one before it through a SHA-256 hash. The log stores:
+
+- The entry's canonical JSON (RFC 8785)
+- The hash of the previous entry (`prevHash`)
+- The hash of this entry (`hash`), computed over the entry's own data plus `prevHash`
+- A monotonically increasing sequence number (`seq`)
+- The receipt time (set by the log, never by the caller)
+
+```typescript
+// packages/shared/src/audit-log.ts
+export interface AuditRecord {
+  /** Position in the chain, from 1. */
+  seq: number;
+  /** When the log received it (ISO 8601), set by the log. */
+  receivedAt: string;
+  /**
+   * The event exactly as it was stored and hashed: its canonical JSON (RFC 8785).
+   * This, not `event`, is what the hash covers.
+   */
+  eventJson: string;
+  event: AuditEvent | null;
+  type: AuditEventType | null;
+  version: number;
+  prevHash: string;
+  hash: string;
+  /**
+   * Whether it's an event, its hash matches `eventJson` and its other fields,
+   * and it links to the entry before it as the log holds that now.
+   */
+  verified: boolean;
+}
+```
+
+Receipt times never go backwards along the chain. If the system clock is behind the last receipt time, the log holds it at the last time and logs a warning. This means a time range in a query is always a range of sequence positions.
+
+## Chain verification
+
+The admin UI and the `verify` API allow step-by-step verification of the full chain — from the first entry to the head, including archived stretches:
+
+```typescript
+// packages/shared/src/audit-log.ts
+export type ChainVerification =
+  | {
+      ok: true;
+      through: number;
+      head: string;
+      done: boolean;
+      /** Set when this stretch was purged by retention. */
+      purged?: true;
+    }
+  | { ok: false; brokenAt: number; reason: ChainBreak };
+
+export type ChainBreak = "missing" | "unlinked" | "altered";
+```
+
+Verification is performed one stretch at a time (`verify(after?)`) to keep memory use bounded. Pass `through` as the next call's `after` until `done` is `true`. A break — `missing`, `unlinked`, or `altered` — names the first position where the chain fails. Nothing after a break is considered verified.
+
+The log tracks the last complete verification pass (`lastFullVerification`), including when it ran and whether it found a break.
+
+## Retention settings
+
+Two environment variables control how long the audit log keeps events:
+
+<ParamField path="AUDIT_RETENTION_DAYS" type="number">
+  How many days events stay searchable in the live log before being moved to the archive. Default: 180 days. Minimum: 30 days. Maximum: 10 years. Must be a whole number. An invalid value is logged as `config.invalid` and nothing is archived until it is fixed — events stay searchable indefinitely.
+</ParamField>
+
+<ParamField path="AUDIT_ARCHIVE_RETENTION_DAYS" type="number">
+  Total age at which an event is permanently deleted — log plus archive combined. Must be at least `AUDIT_RETENTION_DAYS` and at least one year. Maximum: 10 years. Unset means events are archived but **never deleted** from the archive. This value is set by the console per deployment to match the client's Data Processing Agreement; no in-product session can change it.
+</ParamField>
+
+<Warning>
+  `AUDIT_ARCHIVE_RETENTION_DAYS` is deployment configuration, not an in-product setting. A compromised admin session cannot shorten it. Only a console deployment action changes it, and each change is itself audited. Setting it shorter than `AUDIT_RETENTION_DAYS` is refused.
+</Warning>
+
+## The archive
+
+When events age past `AUDIT_RETENTION_DAYS`, the log moves them to the **archive** — an R2 bucket in the EU. The move preserves the full chain: the hash before the archived stretch and the hash at its end are recorded, so verification can check that the archived object links correctly even after the live entries are gone.
+
+Each archived stretch is an NDJSON file (one entry per line) stored at a path that includes the log's Durable Object ID (so logs from different deployments or restores never collide) and the start/end sequence numbers.
+
+When `AUDIT_ARCHIVE_RETENTION_DAYS` is set and an archived stretch is old enough, the log records a `audit.purged` event in the live chain first, then deletes the archive object. Verification of a purged stretch reports it as `purged: true` and carries on — not as a break.
+
+## Admin UI: search and export
+
+The audit log UI is available to admins at the Audit section. It supports:
+
+- **Filtering** by time range, actor type, actor ID, event type, action prefix, target type, target ID, and resource
+- **Pagination** — results are newest first, paged by sequence position
+- **Export** in JSON or CSV format (up to 100,000 records per export)
+
+Exports include each record's `eventJson` (the exact bytes that were hashed) and `verified` flag, so anyone can independently recompute the hash and compare it with the live chain.
+
+```typescript
+// packages/shared/src/audit-log.ts
+export const auditFilterSchema = z.strictObject({
+  from: timeSchema.optional(),
+  to: timeSchema.optional(),
+  actorType: z.enum(actorTypes).optional(),
+  /** A person's user ID, an agent's ID, an App's ID, or a run ID. */
+  actorId: identifierSchema.optional(),
+  type: auditEventTypeSchema.optional(),
+  /** The action or a dotted prefix: `connection` finds `connection.call`. */
+  action: auditActionPrefixSchema.optional(),
+  targetType: identifierSchema.optional(),
+  targetId: identifierSchema.optional(),
+  resource: identifierSchema.optional(),
+}).default({});
+```
+
+Action filtering uses dotted prefix matching: `connection` finds `connection.call`, `connection.connect`, `connection.disconnect`, and so on. `workflow.run` finds all run lifecycle events. This means you can filter broadly (all knowledge events with `knowledge`) or narrowly (`knowledge.document.saved`).
+
+Every search that returns records, every export, and every verification that finishes or finds a break is itself written to the audit log as `audit.searched`, `audit.exported`, or `audit.verified`.

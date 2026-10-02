@@ -1,0 +1,378 @@
+---
+title: "Workflow Testing — In-Memory Harness and Test Suites"
+sidebarTitle: "Testing"
+description: "testRun, dryRun, workflowTests, and createTestEngine run workflows in-memory with mocks. A version with failing tests, or none at all, cannot be activated."
+---
+
+Every workflow ships with a test suite. `@grasp-os/sdk/testing` provides an in-memory engine that replays your workflow code, records what each step did, and short-circuits side effects so tests never change production data. A workflow version whose tests fail — or that has no tests — cannot be made current in any deployment. The test harness simulates the same replay semantics as the real Cloudflare Workflows engine: a step that already ran returns its recorded result on subsequent passes.
+
+```ts
+import {
+  createTestEngine,
+  testRun,
+  dryRun,
+  workflowTests,
+  runWorkflowTests,
+} from '@grasp-os/sdk/testing';
+```
+
+---
+
+## createTestEngine
+
+Creates a reusable in-memory `WorkflowEngine` you can run a workflow definition against directly. Useful when you need low-level control over replay behaviour or want to introspect `steps`, `modelRequests`, and `decisions` after the run.
+
+```ts
+createTestEngine(options?: TestEngineOptions): {
+  engine: WorkflowEngine;
+  steps: StepRecord[];
+  modelRequests: ModelRequest[];
+  decisions: { step: string; from: string; deadline: number }[];
+}
+```
+
+### TestEngineOptions
+
+<ParamField path="runId" type="string" optional>
+  The run ID used in idempotency keys. Defaults to `run-1`.
+</ParamField>
+
+<ParamField path="params" type="Record<string, unknown>" optional>
+  Param values keyed by param name. Missing params fall back to the workflow's declared defaults.
+</ParamField>
+
+<ParamField path="env" type="WorkflowEnv" optional>
+  Stand-in bindings for the run (`env.OUTLOOK`, etc.), for steps that actually run. Omit for steps you mock.
+</ParamField>
+
+<ParamField path="mocks" type="Record<string, StepMock>" optional>
+  Results keyed by step name, returned instead of running the step. For a keyed step, the key is `name:keyValue`; if there's no match for the full key the mock for `name` alone is used. For an `llm` step the mock is the model's raw answer — it is still validated against the step's schema.
+</ParamField>
+
+<ParamField path="failures" type="Record<string, string>" optional>
+  Steps that fail, keyed the same way as `mocks`. The value is the error message. Use the same `name` or `name:key` form.
+</ParamField>
+
+<ParamField path="model" type="(request: ModelRequest) => unknown" optional>
+  A function that answers model gateway calls. An `llm` step without a mock and without a `model` function fails with an explanatory error.
+</ParamField>
+
+<ParamField path="decisions" type="Record<string, DecisionAnswer>" optional>
+  Pre-supplied answers to decisions, keyed by the decision step's name (or `name:key`). A decision without an answer times out immediately (after its reminder if one is configured).
+</ParamField>
+
+<ParamField path="attachments" type="Record<string, readonly Uint8Array[]>" optional>
+  Attachment content for email trigger messages. Keyed by `message.stored`, an array in the order of `message.attachments`. Reading any other stored name fails with `workflow.attachment_not_found`.
+</ParamField>
+
+<ParamField path="sideEffects" type="'record' | 'run'" optional>
+  `record` (the default for `testRun` and `dryRun`) records side-effect steps without running them. `run` actually calls the step's function — useful when running against a fake of the system it changes.
+</ParamField>
+
+<ParamField path="skipTime" type="(milliseconds: number) => void" optional>
+  Called with the duration of each sleep and timed-out decision wait. The engine skips time; use this hook to advance a fake clock for code that checks `Date.now()`.
+</ParamField>
+
+---
+
+## testRun
+
+Runs a workflow once in memory. Side-effect steps are always recorded, never executed. Returns a `TestRun` describing what happened. **Never throws** for workflow errors — a failed run comes back with `status: 'failed'` and its `error`.
+
+```ts
+testRun<Output>(
+  definition: WorkflowDefinition<Output>,
+  options?: TestRunOptions
+): Promise<TestRun<Output>>
+```
+
+`TestRunOptions` is `TestEngineOptions` without `sideEffects` or `skipTime`, plus:
+
+<ParamField path="input" type="unknown" optional>
+  The run's input, validated against the workflow's `config.input` schema if one is declared.
+</ParamField>
+
+### TestRun
+
+```ts
+type TestRun<Output> = (
+  | { status: 'completed'; output: Output }
+  | { status: 'failed'; error: Error }
+) & {
+  steps: StepRecord[];
+  sideEffects: SideEffect[];
+};
+```
+
+`sideEffects` is derived from `steps` — every side-effect step that didn't fail, in the order it would run, with its `name` and `input`.
+
+### Example
+
+```ts
+import definition from './workflows/invoice-approval';
+import { testRun } from '@grasp-os/sdk/testing';
+
+const run = await testRun(definition, {
+  input: { invoiceId: 'INV-7', amount: 750_000, vendor: 'Acme' },
+  params: { threshold: 500_000, reviewer: 'role:finance' },
+  decisions: { review: { approved: true, by: 'usr_01abc' } },
+  mocks: {
+    book: null, // side-effect mock; actual result unused
+  },
+});
+
+expect(run.status).toBe('completed');
+expect(run.output).toEqual({ approved: true });
+expect(run.sideEffects).toEqual([
+  { name: 'book', input: { invoiceId: 'INV-7', amount: 750_000 } },
+]);
+```
+
+---
+
+## dryRun
+
+Like `testRun` but with a human-readable `report` — all read steps execute (using your stand-in bindings), and side-effect steps are recorded with their input. Returns a `DryRun`, which extends `TestRun` with a `report` string.
+
+```ts
+dryRun<Output>(
+  definition: WorkflowDefinition<Output>,
+  options?: TestRunOptions
+): Promise<DryRun<Output>>
+```
+
+### DryRun
+
+```ts
+type DryRun<Output> = TestRun<Output> & {
+  report: string;
+};
+```
+
+The `report` is plain text formatted for a person to read. It lists every step, its input and output (or that it was recorded as a side effect), and a "Would have changed" section listing all side effects. Example:
+
+```
+Dry run of invoice-approval
+Completed with {"approved":true}
+
+Steps:
+- fetch-invoice {"id":"INV-7"}: ran, returned {"amount":750000,"vendor":"Acme"}
+- book {"invoiceId":"INV-7","amount":750000}: would change something, not run, so it has no result
+
+Would have changed:
+- book {"invoiceId":"INV-7","amount":750000}
+```
+
+<Note>
+  A step recorded as a side effect has no result. Steps after it that use that result may behave differently in a dry run than in a real run where the side effect produced an actual return value.
+</Note>
+
+---
+
+## workflowTests
+
+Declares a workflow's test suite as the default export of a `*.workflow-tests.ts` file placed alongside the workflow file.
+
+```ts
+workflowTests<Output>(
+  definition: WorkflowDefinition<Output>,
+  tests: WorkflowTest[]
+): WorkflowTests<Output>
+```
+
+### WorkflowTest
+
+```ts
+interface WorkflowTest extends TestRunOptions {
+  name: string;
+  expect: {
+    output?: unknown;          // run completes with this output (deep equal)
+    error?: string;            // run fails with a message containing this string
+    sideEffects?: SideEffect[]; // exactly these side effects, in this order
+  };
+}
+```
+
+A test expects the run to **complete** unless it names an `error`. Each expectation is independent — you can check `output` and `sideEffects` together.
+
+### File convention
+
+Place the test file next to its workflow:
+
+```
+workflows/
+  invoice-approval.ts              ← the workflow
+  invoice-approval.workflow-tests.ts  ← its tests
+```
+
+Only `workflows/<id>.ts` (where `<id>` contains no dots) is loaded as a workflow. Shared helpers go in subdirectories like `workflows/lib/`.
+
+### Example
+
+```ts
+// workflows/invoice-approval.workflow-tests.ts
+import definition from './invoice-approval';
+import { workflowTests } from '@grasp-os/sdk/testing';
+
+export default workflowTests(definition, [
+  {
+    name: 'approved above threshold',
+    input: { invoiceId: 'INV-7', amount: 750_000, vendor: 'Acme' },
+    params: { threshold: 500_000, reviewer: 'role:finance' },
+    decisions: { review: { approved: true, by: 'usr_01abc' } },
+    expect: {
+      output: { approved: true },
+      sideEffects: [
+        { name: 'book', input: { invoiceId: 'INV-7', amount: 750_000 } },
+      ],
+    },
+  },
+  {
+    name: 'auto-approved below threshold',
+    input: { invoiceId: 'INV-8', amount: 200_000, vendor: 'Acme' },
+    params: { threshold: 500_000, reviewer: 'role:finance' },
+    expect: {
+      output: { approved: true },
+      sideEffects: [
+        { name: 'book', input: { invoiceId: 'INV-8', amount: 200_000 } },
+      ],
+    },
+  },
+  {
+    name: 'rejected by reviewer',
+    input: { invoiceId: 'INV-9', amount: 750_000, vendor: 'Acme' },
+    params: { threshold: 500_000, reviewer: 'role:finance' },
+    decisions: { review: { approved: false, by: 'usr_01abc' } },
+    expect: {
+      output: { approved: false, reason: 'rejected' },
+      sideEffects: [], // nothing booked
+    },
+  },
+  {
+    name: 'timed out',
+    input: { invoiceId: 'INV-10', amount: 750_000, vendor: 'Acme' },
+    params: { threshold: 500_000, reviewer: 'role:finance' },
+    // no decision → times out immediately
+    expect: {
+      output: { approved: false, reason: 'timed-out' },
+      sideEffects: [],
+    },
+  },
+]);
+```
+
+---
+
+## runWorkflowTests
+
+Runs all of a workflow's tests in sequence. Returns a `TestReport`. A workflow whose report doesn't have `passed: true` cannot be made current.
+
+```ts
+runWorkflowTests<Output>(suite: WorkflowTests<Output>): Promise<TestReport>
+```
+
+### TestReport
+
+```ts
+interface TestReport {
+  passed: boolean;     // true only when every test passed and there is at least one
+  results: TestResult[];
+}
+
+interface TestResult {
+  name: string;
+  passed: boolean;
+  failures: string[];  // one line per missed expectation
+}
+```
+
+```ts
+import suite from './workflows/invoice-approval.workflow-tests';
+import { runWorkflowTests } from '@grasp-os/sdk/testing';
+
+const report = await runWorkflowTests(suite);
+
+if (!report.passed) {
+  for (const result of report.results) {
+    if (!result.passed) {
+      console.error(result.name, result.failures.join('\n'));
+    }
+  }
+}
+```
+
+A workflow with **no tests** does not pass — `results` will be empty and `passed` will be `false`.
+
+---
+
+## Types reference
+
+### StepRecord
+
+What the engine recorded for each step in the run:
+
+```ts
+type StepRecord =
+  | {
+      type: 'step';
+      name: string;         // with key if keyed: 'pay:inv-7'; parts of decisions: 'review#ask'
+      sideEffect: boolean;
+      input?: Json;
+      status: 'ran' | 'mocked' | 'recorded';
+      output: unknown;
+    }
+  | {
+      type: 'step';
+      name: string;
+      sideEffect: boolean;
+      input?: Json;
+      status: 'failed';
+      error: string;
+    }
+  | { type: 'sleep'; name: string; milliseconds: number }
+  | {
+      type: 'wait';
+      name: string;
+      eventType: string;   // e.g. 'decision:review'
+      timeout: number;
+      event:
+        | { received: true; payload: unknown }
+        | { received: false };
+    };
+```
+
+`status` meanings:
+- `'ran'` — the step's function ran normally.
+- `'mocked'` — the result came from `options.mocks` instead of running the function.
+- `'recorded'` — a side-effect step that wasn't run (its input is the record).
+- `'failed'` — the step threw; `error` is the message.
+
+### SideEffect
+
+```ts
+interface SideEffect {
+  name: string;
+  input?: Json;
+}
+```
+
+The side effects the run would have had, in the order they would happen.
+
+### StepCall
+
+Passed to a function mock so it can inspect the call:
+
+```ts
+interface StepCall {
+  name: string;   // 'pay:inv-7' for a keyed step
+  input?: Json;
+}
+```
+
+### StepMock
+
+```ts
+type StepMock = Json | ((call: StepCall) => Json | Promise<Json>);
+```
+
+A plain value or a function that computes the result. For `llm` steps the mock is the model's raw answer — the step still validates it against its schema.
